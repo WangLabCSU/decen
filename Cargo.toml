@@ -1,6 +1,7 @@
 [package]
 name = "decen"
 version = "0.1.0"
+authors = ["Yun Peng <pengyun.me@outlook.com>"]
 edition = "2024"
 rust-version = "1.95"
 description = "A decoder and encoder (decen) framework for byte streams"
