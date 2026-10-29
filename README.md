@@ -4,6 +4,9 @@
 for defining frame boundaries, decoding frames, and encoding values, together
 with buffered readers and writers that use those implementations.
 
+The design is inspired by Tokio's
+[`tokio-util::codec`](https://docs.rs/tokio-util/latest/tokio_util/codec/index.html).
+
 You implement the format's framing, decoding, or encoding traits as needed. A
 decoded result or a value supplied to an encoder is called an **Item**. Input
 need not be UTF-8, and reading and writing can be used independently.
