@@ -4,8 +4,15 @@
 for defining frame boundaries, decoding frames, and encoding values, together
 with buffered readers and writers that use those implementations.
 
-The design is inspired by Tokio's
-[`tokio-util::codec`](https://docs.rs/tokio-util/latest/tokio_util/codec/index.html).
+The design is inspired by
+[`tokio-util::codec`](https://docs.rs/tokio-util/latest/tokio_util/codec/index.html),
+which adapts asynchronous I/O into `Stream` and `Sink` transports. decen focuses
+on efficient frame processing through `std::io::Read` and `std::io::Write`,
+emphasizing memory reuse and control over the ownership of decoded data.
+
+Borrow framed bytes for immediate processing, retain them without copying, or
+build an owned Item containing only the data you need. A single framing
+implementation can support all three modes.
 
 You implement the format's framing, decoding, or encoding traits as needed. A
 decoded result or a value supplied to an encoder is called an **Item**. Input
