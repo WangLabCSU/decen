@@ -22,6 +22,9 @@ use crate::DEFAULT_BUF_SIZE;
 /// implements [`Framer`] and one or more of [`BytesDecoder`], [`ViewDecoder`],
 /// and [`OwnedDecoder`].
 ///
+/// Framing and decoding use the same format instance throughout reading. It
+/// can retain parsing state across calls, including while awaiting more input.
+///
 /// Choose a decoding method based on how the Item uses its input:
 ///
 /// - [`decode_view`](Self::decode_view) requires [`ViewDecoder`] decoder and

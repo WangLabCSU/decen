@@ -193,9 +193,8 @@ impl Frame {
 /// [`BytesDecoder`], [`ViewDecoder`], or [`OwnedDecoder`]. These traits define
 /// how framed bytes become Items.
 ///
-/// Implementations may keep parsing state in `self`, such as a length read
-/// from a header or whether a quoted field is still open. Formats that need
-/// no state can use a unit struct.
+/// Framing and decoding can be stateful. Implementations may keep parsing
+/// state in `self` across calls.
 pub trait Framer {
     /// The error type shared by framing, decoding, and input I/O.
     ///
