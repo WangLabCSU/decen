@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Rust ${{ matrix.toolchain }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.95.0"]
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Test
+        run: cargo test --locked --all-features
+
+      - name: Install formatting and lint tools
+        if: matrix.toolchain == 'stable'
+        run: rustup component add rustfmt clippy
+
+      - name: Check formatting
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Check documentation
+        if: matrix.toolchain == 'stable'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --all-features --no-deps
