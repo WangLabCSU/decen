@@ -10,6 +10,7 @@ readme = "README.md"
 repository = "https://github.com/WangLabCSU/decen"
 keywords = ["codec", "framing", "io", "buffer", "zero-copy"]
 categories = ["encoding"]
+exclude = ["/AGENTS.md", "/.github/", "/.gitignore", "/rust-toolchain.toml"]
 
 [dependencies]
 bytes = "1.12.*"
