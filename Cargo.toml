@@ -1,0 +1,21 @@
+[package]
+name = "decen"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A decoder and encoder (decen) framework for byte streams"
+license = "MIT"
+readme = "README.md"
+keywords = ["codec", "framing", "io", "buffer", "zero-copy"]
+categories = ["encoding"]
+
+[dependencies]
+bytes = "1.12.*"
+
+[dev-dependencies]
+memchr = "2.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"
