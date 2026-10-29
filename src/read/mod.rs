@@ -1,11 +1,11 @@
 //! Framing and decoding byte streams with [`FramedRead`].
 
-#![allow(dead_code)]
-
 use std::io::Read;
 
 use bytes::BytesMut;
 
+// Keep the internal Buffer's full API without suppressing reader/decoder lints.
+#[allow(dead_code)]
 mod buffer;
 mod decoder;
 

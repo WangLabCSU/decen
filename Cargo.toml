@@ -6,6 +6,7 @@ rust-version = "1.95"
 description = "A decoder and encoder (decen) framework for byte streams"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/WangLabCSU/decen"
 keywords = ["codec", "framing", "io", "buffer", "zero-copy"]
 categories = ["encoding"]
 
@@ -19,3 +20,11 @@ memchr = "2.8"
 lto = true
 codegen-units = 1
 strip = "debuginfo"
+
+[[bench]]
+name = "read"
+harness = false
+
+[[bench]]
+name = "write"
+harness = false
