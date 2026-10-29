@@ -27,15 +27,15 @@ use crate::DEFAULT_BUF_SIZE;
 ///
 /// Choose a decoding method based on how the Item uses its input:
 ///
-/// - [`decode_view`](Self::decode_view) requires [`ViewDecoder`] decoder and
+/// - [`decode_view`](Self::decode_view) requires [`ViewDecoder`] and
 ///   passes framed bytes as a slice. The returned Item can borrow from that
 ///   slice without copying, making this suitable for processing an Item before
 ///   reading the next one.
-/// - [`decode_owned`](Self::decode_owned) requires [`OwnedDecoder`] decoder and
+/// - [`decode_owned`](Self::decode_owned) requires [`OwnedDecoder`] and
 ///   passes framed bytes as a slice, but the returned Item cannot borrow from
 ///   it. The decoder must explicitly copy any input data the Item needs to
 ///   retain.
-/// - [`decode_bytes`](Self::decode_bytes) requires [`BytesDecoder`] decoder and
+/// - [`decode_bytes`](Self::decode_bytes) requires [`BytesDecoder`] and
 ///   passes framed bytes directly as an owned [`bytes::BytesMut`]. The Item can
 ///   retain those bytes across reads, allowing zero-copy decoding without
 ///   borrowing from the reader.
@@ -55,6 +55,10 @@ use crate::DEFAULT_BUF_SIZE;
 /// Reading and buffering may still allocate or copy input bytes. Capacity is
 /// not a memory limit: large Items can grow the buffer, and retained owned
 /// Items can keep shared allocations alive after the reader is dropped.
+///
+/// Consumption and changes to format state are not rolled back on errors.
+/// A decoding error occurs after the framing decision's consumption has been
+/// applied. Whether decoding can continue depends on the format.
 ///
 /// # Read contract
 ///
@@ -310,8 +314,7 @@ mod test {
     use super::{BytesDecoder, Frame, FramedRead, Framer, OwnedDecoder, ViewDecoder};
     use crate::test::allocations;
 
-    // Minimal framing fixture for I/O tests, not a public format
-    // implementation.
+    // Minimal framing fixture for I/O tests, not a public format implementation.
     // Retain each LF in the selected bytes; accept a final nonempty EOF tail.
     #[derive(Default)]
     struct Lines {
@@ -885,8 +888,8 @@ mod test {
     }
 
     // Script framing decisions independently of the reader's implementation.
-    // Record
-    // the slices seen by framing and decoding to check both coordinate systems.
+    // Record the slices seen by framing and decoding to check both coordinate
+    // systems.
     #[derive(Default)]
     struct FrameScript {
         frames: VecDeque<io::Result<Frame>>,
@@ -2071,8 +2074,7 @@ mod test {
 
     #[test]
     fn bounded_items_reuse_consumed_space_instead_of_growing_with_the_stream() {
-        // Three-byte Items straddle an eight-byte buffer. A pending tail
-        // prevents
+        // Three-byte Items straddle an eight-byte buffer. A pending tail prevents
         // the empty-buffer reset from masking a failure to reclaim the prefix.
         for (view, copy) in [(true, false), (false, true), (false, false)] {
             let mut reader = FramedRead::with_capacity(Repeating::default(), Triples { copy }, 8);

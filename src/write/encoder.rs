@@ -3,7 +3,7 @@ use std::io::{self, Write};
 /// Encodes Items to a [`Write`] destination.
 ///
 /// `Item` may contain borrowed fields. An encoder may implement this trait for
-/// multiple input types.
+/// multiple input types and keep format state across calls.
 ///
 /// # Examples
 ///

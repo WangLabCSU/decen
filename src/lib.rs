@@ -1,31 +1,4 @@
-//! Traits and buffered I/O for building decoders and encoders.
-//!
-//! [`FramedRead`] reads a byte stream, uses a [`Framer`] to select complete
-//! frames, and passes the framed bytes to a decoder. Choose a decoding method
-//! based on how the Item uses those bytes:
-//!
-//! - [`FramedRead::decode_view`] requires [`ViewDecoder`]. The Item can borrow
-//!   framed bytes, making it suitable for processing before the next read.
-//! - [`FramedRead::decode_owned`] requires [`OwnedDecoder`]. The Item cannot
-//!   borrow the input slice; the decoder explicitly copies input data it needs
-//!   to retain.
-//! - [`FramedRead::decode_bytes`] requires [`BytesDecoder`] and passes an owned
-//!   [`bytes::BytesMut`], allowing the Item to retain framed bytes across
-//!   reads.
-//!
-//! [`FramedWrite`] uses an [`Encoder`] to encode Items and buffers the output.
-//!
-//! [`FramedRead`]: read::FramedRead
-//! [`Framer`]: read::Framer
-//! [`FramedRead::decode_view`]: read::FramedRead::decode_view
-//! [`FramedRead::decode_owned`]: read::FramedRead::decode_owned
-//! [`FramedRead::decode_bytes`]: read::FramedRead::decode_bytes
-//! [`ViewDecoder`]: read::ViewDecoder
-//! [`OwnedDecoder`]: read::OwnedDecoder
-//! [`BytesDecoder`]: read::BytesDecoder
-//! [`FramedWrite`]: write::FramedWrite
-//! [`Encoder`]: write::Encoder
-
+#![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
 pub mod read;

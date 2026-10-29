@@ -32,8 +32,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 /// after those bytes; `spare_capacity` is the remaining uninitialized capacity.
 /// Together, the last two regions make up [`spare`](Self::spare).
 ///
-/// This view excludes storage held by previously split results. `buffer_size`
-/// tracks the refill size across splits, not a boundary in the diagram.
+/// This view excludes storage held by previously split results.
 ///
 /// # Examples
 ///
@@ -61,8 +60,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 // buf.len() includes the initialized portion of spare space. Raw appends
 // temporarily lower it to borrow capacity as MaybeUninit<u8>, then restore it
 // once all bytes up to the new length are initialized.
-// write_buf deliberately bypasses this initialization invariant while calling
-// Read. A source panic also bypasses that method's length restoration.
+// write_buf lends spare capacity to Read under the temporary write-only
+// contract. It extends buf.len() only after a successful, bounded read, so
+// an error or panic cannot mark unwritten bytes as initialized.
 //
 // Split results own disjoint views that may outlive this buffer. They can clear
 // and uninitialize their storage. Reclaiming it must not expose those bytes as
@@ -371,8 +371,8 @@ impl Buffer {
         // sum.
         assert!(addition <= len - end, "cannot consume past buffered input");
         // Split before discarding prefixes: promoting BytesMut to shared
-        // storage
-        // can allocate. An allocation panic must leave these counts consistent.
+        // storage can allocate. An allocation panic must leave these counts
+        // consistent.
         let skip = self.consumed + start;
         let mut bytes = self.buf.split_to(self.consumed + end);
         self.buffered -= end + addition;
@@ -543,8 +543,8 @@ impl Buffer {
         // BytesMut uses its length to calculate the required capacity and the
         // cost of copying data back into released space. Exclude the spare tail
         // so it does not inflate either: reserve could otherwise allocate more
-        // memory, or try_reclaim could fail despite room for buffered +
-        // additional.
+        // memory, or try_reclaim could fail despite room for the data and the
+        // requested append space.
         // This also discards initialization tracking for the tail.
         //
         // SAFETY: advancing past consumed bytes leaves the initialized buffered
@@ -558,14 +558,11 @@ impl Buffer {
         } else {
             let reclaimed = self.buf.try_reclaim(additional);
             if reclaimed {
-                // Reclaiming does not grow the allocation, but can restore
-                // capacity
-                // outside the current view. For adopted storage, that can
-                // exceed the
-                // size recorded by put; keep buffer_size >= capacity()
-                // afterwards.
-                self.buffer_size = self.buffer_size.max(self.capacity())
-            };
+                // Reclaiming can restore capacity outside the current view.
+                // For adopted storage this can exceed the size recorded by
+                // put; keep buffer_size >= capacity().
+                self.buffer_size = self.buffer_size.max(self.capacity());
+            }
             reclaimed
         }
     }
@@ -586,9 +583,8 @@ impl Buffer {
             .expect("buffer capacity overflow");
         let mut allocated = BytesMut::with_capacity(capacity);
         // SAFETY: capacity is at least len, and buffer() contains len
-        // initialized
-        // bytes. For nonzero len, the new allocation is disjoint from the still
-        // live source allocation. The copy initializes exactly the new length.
+        // initialized bytes. For nonzero len, the new allocation is disjoint
+        // from the still live source. The copy initializes the new length.
         unsafe {
             ptr::copy_nonoverlapping(
                 self.buffer().as_ptr(),
@@ -666,40 +662,27 @@ impl Buffer {
         let capacity = self.buf.capacity();
         let available = capacity - filled;
 
-        // Deliberately expose spare capacity without initializing it. This
-        // bypasses the initialization requirements of Read.
-        unsafe { self.buf.set_len(capacity) };
-        let result = reader.read(&mut self.buf[filled..]);
+        // SAFETY: filled <= buf.len(), so shortening retains only initialized
+        // bytes. Do this before calling user code: errors and panics then leave
+        // no uncommitted tail included in buf.len().
+        unsafe { self.buf.set_len(filled) };
 
-        let nread = match result {
-            Ok(nread) if nread <= available => {
-                // SAFETY: nread <= capacity - filled bounds the sum by capacity
-                // and prevents overflow. This unchecked path assumes Read wrote
-                // the reported bytes; retain them after the initialized prefix,
-                // excluding the rest of the temporary tail.
-                unsafe { self.buf.set_len(filled + nread) };
-                nread
-            }
-            Ok(nread) => {
-                // SAFETY: filled <= capacity and 0..filled was initialized
-                // before
-                // Read borrowed only the tail. Restore that prefix without
-                // using
-                // the invalid count, excluding all bytes from this failed read.
-                unsafe { self.buf.set_len(filled) };
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Read returned {nread} bytes for a buffer of {available} bytes"),
-                ));
-            }
-            Err(error) => {
-                // SAFETY: filled bounds the existing initialized prefix within
-                // the unchanged capacity. Read could modify only the tail;
-                // exclude all of it because an error commits no new bytes.
-                unsafe { self.buf.set_len(filled) };
-                return Err(error);
-            }
-        };
+        // The exclusive spare slice covers exactly available bytes and stays
+        // valid for the call. Deliberately expose it without initialization
+        // under the temporary write-only Read contract.
+        let spare = self.buf.spare_capacity_mut();
+        let dst = unsafe { slice::from_raw_parts_mut(spare.as_mut_ptr().cast(), available) };
+        let nread = reader.read(dst)?;
+        if nread > available {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Read returned {nread} bytes for a buffer of {available} bytes"),
+            ));
+        }
+        // SAFETY: the checked count bounds filled + nread by capacity. The
+        // read contract requires every reported byte to have been written;
+        // together with the existing prefix, these form an initialized range.
+        unsafe { self.buf.set_len(filled + nread) };
         self.buffered += nread;
         Ok(nread)
     }
@@ -739,7 +722,7 @@ impl Buffer {
         // and a 57,360-byte tail. After moving the tail and reading more input,
         // processing subsequent frames can leave another tail of the same size.
         // Those tails can belong to different frames; it is the copying cost
-        // that **repeats**.
+        // that repeats.
         //
         // Allow one costly move. If the next refill would again copy more than
         // half the bytes being discarded, prefer doubling the recorded capacity
@@ -931,8 +914,7 @@ impl Buffer {
         // set_len(0) changes only metadata; it does not erase the old bytes.
         // The spare slice then covers the full capacity as MaybeUninit<u8>,
         // giving the destination pointer access to the entire reserved range.
-        // No allocation or user code runs between taking the pointer and
-        // copying.
+        // No allocation or user code runs between taking the pointer and copying.
         // Old bytes 0..len remain initialized, and the copy initializes
         // filled..filled+cnt. Since filled <= len, their union has no gap,
         // so restoring max(len, filled+cnt) exposes only initialized bytes.
@@ -992,14 +974,11 @@ impl Buffer {
         // Source:      consumed+start .. consumed+start+cnt
         // Destination: dst_start .. dst_start+cnt
         // src_start + cnt <= dst_start, so these ranges cannot overlap.
-        // The source is initialized and reserve provides enough destination
-        // space.
+        // The source is initialized; reserve provides enough destination space.
         // set_len(0) lets both pointers derive from the same full-capacity
-        // borrow;
-        // no operation in between can move the allocation. Old bytes 0..len
-        // stay
-        // initialized. Since dst_start <= len, the copy extends initialization
-        // without a gap before restoring the larger length.
+        // borrow; no operation in between can move the allocation. Old bytes
+        // 0..len stay initialized. Since dst_start <= len, the copy extends
+        // initialization without a gap before restoring the larger length.
         unsafe {
             self.buf.set_len(0);
             let ptr = self.buf.spare_capacity_mut().as_mut_ptr().cast::<u8>();
@@ -1150,8 +1129,7 @@ unsafe impl BufMut for Buffer {
         if self.spare_len() != 0 {
             // SAFETY: consumed + buffered <= buf.len() bounds the initialized
             // tail. &mut self gives exclusive access to this view; split Items
-            // own
-            // disjoint regions of the allocation.
+            // own disjoint regions of the allocation.
             unsafe {
                 self.buf
                     .get_unchecked_mut((self.consumed + self.buffered)..)
@@ -1174,9 +1152,8 @@ unsafe impl BufMut for Buffer {
             // Drop it before conversion so it does not prevent unique
             // ownership.
             drop(src);
-            // buf.capacity() == 0 implies consumed == buffered == buf.len() ==
-            // 0:
-            // there is no buffered input or initialized tail to preserve here.
+            // Zero capacity implies zero consumed, buffered and initialized
+            // bytes: there is no input or initialized tail to preserve here.
             // From<Bytes> handles both adoption and copying without a separate
             // is_unique / try_into_mut check and its extra virtual call.
             self.buf = BytesMut::from(bytes);
@@ -1531,9 +1508,8 @@ mod test {
                 let count = chunk.len().min(input.len() - written);
                 chunk[..count].copy_from_slice(&input[written..written + count]);
                 assert_eq!(buffer.buffer(), &input[..written]);
-                // SAFETY: the next count bytes were initialized through
-                // chunk_mut;
-                // no intervening operation has moved or discarded them.
+                // SAFETY: the next count bytes were copied through chunk_mut.
+                // No intervening operation has moved or discarded them.
                 unsafe { buffer.advance_mut(count) };
                 written += count;
                 assert_eq!(buffer.remaining_mut(), remaining - count);
@@ -1822,9 +1798,8 @@ mod test {
         buffer.buf[buffer.consumed + buffer.buffered..].copy_from_slice(b"cdefgh");
         assert_eq!(buffer.spare_len(), 6);
         let spare = buffer.buf.spare_capacity_mut();
-        // Safe callers may leave these bytes uninitialized. Neither buffered
-        // data
-        // nor the initialized tail may expose uninitialized bytes.
+        // Safe callers may leave these bytes uninitialized. Neither
+        // buffered data nor the initialized tail may expose them.
         spare.fill(MaybeUninit::uninit());
         spare[0].write(b'i');
         spare[1].write(b'j');
@@ -1851,15 +1826,13 @@ mod test {
                 drop(prefix);
                 buffer.consume(consumed);
 
-                // Reclamation may fail when moving live bytes would cost too
-                // much.
+                // Reclamation may fail when moving live bytes costs too much.
                 // Either result must keep buffered input and initialized spare
-                // valid.
+                // space valid.
                 buffer.try_reclaim(split);
                 assert_eq!(buffer.buffer(), &b"abcdefgh"[split + consumed..]);
-                // Read every spare byte so Miri checks initialization,
-                // including
-                // cases where there is no buffered input left to inspect.
+                // Read every initialized spare byte so Miri can check it,
+                // including when no buffered input remains to inspect.
                 std::hint::black_box(
                     buffer.buf[buffer.consumed + buffer.buffered..]
                         .iter()
@@ -2116,7 +2089,7 @@ mod test {
             fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
                 assert!(dst.len() >= 2);
                 self.1 = dst.len();
-                dst.fill(0xa5);
+                dst[..2].fill(0xa5);
                 match self.0 {
                     0 => Ok(0),
                     1 => Ok(2),
@@ -2167,9 +2140,7 @@ mod test {
                     _ => assert!(result.is_err()),
                 }
                 assert_eq!(buffer.buffer(), expected);
-                if outcome != 5 {
-                    assert_eq!(buffer.spare_len(), 0);
-                }
+                assert_eq!(buffer.spare_len(), 0);
                 assert_eq!(buffer.write_buf(&mut &b"!"[..]).unwrap(), 1);
                 expected.push(b'!');
                 assert_eq!(buffer.buffer(), expected);

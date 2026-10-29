@@ -175,6 +175,8 @@ impl Frame {
 
     /// Skips the first `amount` bytes without producing an Item.
     ///
+    /// The reader immediately calls the framer again with the remaining input.
+    ///
     /// # Contract
     ///
     /// `amount` must not exceed the length of the input supplied to the
@@ -266,7 +268,7 @@ pub trait Framer {
         match frame.0 {
             // Consuming a prefix does not complete the remaining input.
             FrameInner::NeedMore(consume) if consume < src.len() => {
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "expect more to read").into())
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete frame at EOF").into())
             }
             _ => Ok(frame),
         }
