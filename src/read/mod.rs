@@ -153,6 +153,8 @@ impl<R: ?Sized + Read, D> FramedRead<R, D> {
     }
 }
 
+// Inline the decoding entry points into the caller's Item loop so framing
+// and extraction can be optimized without passing an intermediate result.
 impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     /// Decodes the next Item from framed bytes in an owned [`BytesMut`].
     ///
@@ -167,7 +169,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     ///
     /// Panics if the supplied [`Framer`] returns an invalid framing decision,
     /// or if the [`Framer`] or [`BytesDecoder`] implementation panics.
-    #[inline]
+    #[inline(always)]
     pub fn decode_bytes(&mut self) -> Result<Option<D::Item>, D::Error>
     where
         D: BytesDecoder,
@@ -208,7 +210,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     ///
     /// Panics if the supplied [`Framer`] returns an invalid framing decision,
     /// or if the [`Framer`] or [`ViewDecoder`] implementation panics.
-    #[inline]
+    #[inline(always)]
     pub fn decode_view(&mut self) -> Result<Option<D::Item<'_>>, D::Error>
     where
         D: ViewDecoder,
@@ -233,7 +235,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     ///
     /// Panics if the supplied [`Framer`] returns an invalid framing decision,
     /// or if the [`Framer`] or [`OwnedDecoder`] implementation panics.
-    #[inline]
+    #[inline(always)]
     pub fn decode_owned(&mut self) -> Result<Option<D::Item>, D::Error>
     where
         D: OwnedDecoder,
