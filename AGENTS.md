@@ -111,3 +111,12 @@ mod tests;
   cloning. The corresponding `Into` calls are also permitted. Document the
   inherited copying costs and preserve the underlying implementation's lifetime
   and validity requirements.
+
+# Commit Messages
+
+- Prefix commit subjects with a change type, using `type: description` or
+  `type(scope): description`.
+- Choose the type that describes the change: `feat`, `fix`, `docs`, `test`,
+  `refactor`, `perf`, `ci`, `build`, or `chore`.
+- Write concise English descriptions of the actual change. For example,
+  `feat: add framed decoding` or `ci: test stable and MSRV`.
