@@ -76,6 +76,9 @@ pub struct Buffer {
     // Refill size retained across splitting; updated when storage is acquired
     // or grows.
     buffer_size: usize,
+    // Whether the previous refill copied more than half as many bytes as it
+    // discarded. Two consecutive costly compactions trigger growth.
+    costly_compaction: bool,
 }
 
 impl Default for Buffer {
@@ -102,6 +105,7 @@ impl Buffer {
         let buf = BytesMut::with_capacity(capacity);
         Self {
             buffer_size: buf.capacity(),
+            costly_compaction: false,
             buf,
             consumed: 0,
             buffered: 0,
@@ -715,26 +719,49 @@ impl Buffer {
         // threshold, not a prediction of how many bytes Read will return; even
         // a small shortfall can trigger reserve. Zero-capacity buffers request
         // one byte.
-        let additional = self.buffer_size.div_ceil(2).max(1);
+        let min_spare = self.buffer_size.div_ceil(2).max(1);
+
+        // A refill without a costly compaction breaks the sequence.
+        let previous_costly_compaction = mem::take(&mut self.costly_compaction);
 
         // Keep the current view and initialized tail when they supply the
         // batch.
-        if additional <= self.spare() {
+        if min_spare <= self.spare() {
             return;
         }
 
-        // Compact only when it supplies the whole batch and copies no more
-        // bytes than have been consumed. Keep buf.len() unchanged so the
-        // initialized space after the moved data remains available for reads.
-        if additional <= self.spare() + self.consumed && self.consumed >= self.buffered {
+        // Frame boundaries need not align with the end of the buffer. After
+        // earlier frames are consumed, an incomplete frame can remain at the
+        // tail. Compaction makes room to append more input while keeping that
+        // frame contiguous.
+        //
+        // For example, a full 131,264-byte buffer can have 73,904 consumed bytes
+        // and a 57,360-byte tail. After moving the tail and reading more input,
+        // processing subsequent frames can leave another tail of the same size.
+        // Those tails can belong to different frames; it is the copying cost
+        // that **repeats**.
+        //
+        // Allow one costly move. If the next refill would again copy more than
+        // half the bytes being discarded, prefer doubling the recorded capacity
+        // to provide more append space and reduce subsequent compaction.
+        // A cheap refill clears that history, avoiding growth for an isolated
+        // large tail. Keep buf.len() unchanged when compacting to retain the
+        // initialized space after the moved bytes.
+        let can_compact =
+            min_spare <= self.spare() + self.consumed && self.consumed >= self.buffered;
+        let compaction_is_costly = self.buffered > self.consumed / 2;
+        let repeated_costly_compaction =
+            can_compact && compaction_is_costly && previous_costly_compaction;
+        if !repeated_costly_compaction && can_compact {
+            self.costly_compaction = compaction_is_costly;
             self.buf
                 .copy_within(self.consumed..(self.consumed + self.buffered), 0);
             self.consumed = 0;
             return;
         }
 
-        // Compaction cannot supply the batch cheaply. Exclude consumed bytes
-        // before asking BytesMut to reclaim released split space or allocate.
+        // Exclude consumed bytes before asking BytesMut to reclaim released
+        // split space or allocate.
         if self.consumed != 0 {
             self.buf.advance(self.consumed);
             self.consumed = 0;
@@ -750,16 +777,16 @@ impl Buffer {
         // this a length reduction that exposes no new bytes.
         unsafe { self.buf.set_len(self.buffered) };
 
-        // With too little tail space and a frame larger than the normal batch,
-        // target twice the recorded capacity. BytesMut can satisfy the request
-        // by reclaiming released split space or growing the allocation.
-        let extra = if self.buffered > additional {
-            let capacity = self.buffer_size.saturating_mul(2).min(isize::MAX as usize);
-            capacity - self.buf.len()
+        // Double the recorded capacity for a long frame or repeated costly
+        // compaction. Otherwise, ask only for the normal batch so BytesMut can
+        // reclaim released split space without growing the allocation.
+        let additional = if repeated_costly_compaction || self.buffered > min_spare {
+            let cap = self.buffer_size.saturating_mul(2).min(isize::MAX as usize);
+            cap - self.buf.len()
         } else {
-            additional
+            min_spare
         };
-        self.buf.reserve(extra);
+        self.buf.reserve(additional);
         // Record reservation results without lowering the size after a split.
         // A larger returned capacity also raises future half-size batch
         // requests.
@@ -2926,6 +2953,38 @@ mod test {
                 assert_eq!(buffer.buffer_size, buffer.capacity());
                 assert_eq!(buffer.buffer(), vec![0x5a; filled - consumed]);
                 assert!(buffer.spare() >= 32);
+            }
+        }
+    }
+
+    #[test]
+    fn make_room_grows_only_after_repeated_costly_compactions() {
+        for consumed in [36, 60] {
+            let mut buffer = Buffer::with_capacity(64);
+            buffer.extend_from_slice(&[b'x'; 64]);
+            buffer.consume(36);
+            buffer.make_room();
+            assert_eq!(buffer.capacity(), 64);
+            assert_eq!(buffer.buffer(), &[b'x'; 28]);
+
+            buffer.extend_from_slice(&[b'y'; 36]);
+            buffer.consume(consumed);
+            buffer.make_room();
+            assert_eq!(buffer.buffer(), vec![b'y'; 64 - consumed]);
+            assert!(buffer.spare() >= 32);
+            if consumed == 36 {
+                // A second large tail gets more room instead of being moved
+                // within the same capacity on every subsequent refill.
+                assert!(buffer.capacity() >= 128);
+            } else {
+                // The small tail clears the history. A later large tail can
+                // be compacted without growing the buffer.
+                assert_eq!(buffer.capacity(), 64);
+                buffer.extend_from_slice(&[b'z'; 60]);
+                buffer.consume(36);
+                buffer.make_room();
+                assert_eq!(buffer.capacity(), 64);
+                assert_eq!(buffer.buffer(), &[b'z'; 28]);
             }
         }
     }
