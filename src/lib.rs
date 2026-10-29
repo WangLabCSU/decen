@@ -33,8 +33,8 @@ pub mod write;
 
 // ESP-IDF has a smaller default to accommodate limited RAM.
 const DEFAULT_BUF_SIZE: usize = cfg_select! {
-    target_os = "espidf" => 512,
-    _ => 8 * 1024,
+    target_os = "espidf" => 1 << 9,
+    _ => 8 << 10,
 };
 
 // Shared allocation counter for buffer and reader tests. These tests check

@@ -3,7 +3,6 @@
 #![allow(dead_code)]
 
 use std::io::Read;
-use std::ops::Bound;
 
 use bytes::BytesMut;
 
@@ -179,20 +178,14 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         };
         match ready {
             FrameReady::Copy { range, consume } => {
-                let view = self.buffer.take_view(
-                    (range.start_bound().cloned(), range.end_bound().cloned()),
-                    consume,
-                );
+                let view = self.buffer.take_view(range.bounds(), consume);
                 let mut bytes = BytesMut::with_capacity(view.len());
                 bytes.extend_from_slice(view);
                 self.decoder.decode_bytes(bytes).map(Some)
             }
             FrameReady::Split { range, addition } => self
                 .decoder
-                .decode_bytes(
-                    self.buffer
-                        .take_bytes((range.start_bound(), range.end_bound()), addition),
-                )
+                .decode_bytes(self.buffer.take_bytes(range.bounds(), addition))
                 .map(Some),
         }
     }
@@ -251,24 +244,12 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     // mutated independently. Inline to simplify bounds for each framer.
     #[inline(always)]
     fn take_frame_view(buffer: &mut Buffer, ready: FrameReady) -> &[u8] {
-        let (range, consume) = match ready {
-            FrameReady::Copy { range, consume } => (range, consume),
+        match ready {
+            FrameReady::Copy { range, consume } => buffer.take_view(range.bounds(), consume),
             FrameReady::Split { range, addition } => {
-                let end = match range.end_bound() {
-                    Bound::Included(end) => end.checked_add(1).expect("range end overflow"),
-                    Bound::Excluded(end) => *end,
-                    Bound::Unbounded => buffer.len(),
-                };
-                let consume = end
-                    .checked_add(addition)
-                    .expect("frame consumption overflow");
-                (range, consume)
+                buffer.take_split_view(range.bounds(), addition)
             }
-        };
-        buffer.take_view(
-            (range.start_bound().cloned(), range.end_bound().cloned()),
-            consume,
-        )
+        }
     }
 
     // Keep framing in the caller's Item loop.

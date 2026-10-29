@@ -264,6 +264,61 @@ impl Buffer {
         unsafe { slice::from_raw_parts(self.buf.as_ptr().add(offset), end - start) }
     }
 
+    /// Returns a slice of the bytes in `range`, consuming everything through
+    /// the end of that range and another `addition` bytes after it.
+    ///
+    /// Bytes before the range and the additional bytes are discarded. All
+    /// indices refer to the buffered data before this call.
+    ///
+    /// No bytes are copied. The returned slice borrows the buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// use crate::read::buffer::Buffer;
+    ///
+    /// let mut buf = Buffer::new();
+    /// buf.extend_from_slice(b"<hello>tail");
+    /// let view = buf.take_split_view(1..6, 1);
+    ///
+    /// assert_eq!(view, b"hello");
+    /// assert_eq!(buf.buffer(), b"tail");
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is invalid or its end plus `addition` exceeds
+    /// `self.len()`. The buffer is unchanged in either case.
+    #[inline]
+    pub fn take_split_view(&mut self, range: impl RangeBounds<usize>, addition: usize) -> &[u8] {
+        let len = self.len();
+        let end = match range.end_bound() {
+            Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
+            Bound::Excluded(&end) => end,
+            Bound::Unbounded => len,
+        };
+        let start = match range.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start.checked_add(1).expect("range start overflow"),
+            Bound::Unbounded => 0,
+        };
+        assert!(start <= end && end <= len, "view range out of bounds");
+        // end <= len makes subtraction safe. Checking the remaining space
+        // before adding also rejects an overflowing end + addition.
+        assert!(
+            addition <= len - end,
+            "cannot consume view past buffered input"
+        );
+        let consume = end + addition;
+        let offset = self.consumed + start;
+        self.consumed += consume;
+        self.buffered -= consume;
+        // SAFETY: the checked range lies within the previously buffered data.
+        // Consuming changes only the counts, so those initialized bytes remain
+        // in place. The returned borrow prevents further mutation.
+        unsafe { slice::from_raw_parts(self.buf.as_ptr().add(offset), end - start) }
+    }
+
     /// Returns the bytes in `range` as a [`BytesMut`], consuming everything
     /// through the end of that range and another `addition` bytes after it.
     ///
@@ -598,7 +653,9 @@ impl Buffer {
     ///
     /// Panics if buffer capacity overflows. If the reader panics, bytes written
     /// by that call are not appended.
-    #[inline(never)]
+    // Inline so the concrete Read implementation and the framing loop can
+    // optimize their buffer access together.
+    #[inline(always)]
     pub fn write_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {
         self.make_room();
         let filled = self.consumed + self.buffered;
@@ -1563,10 +1620,11 @@ mod test {
     }
 
     #[test]
-    fn take_bytes_handles_empty_full_and_invalid_ranges() {
+    fn split_extraction_handles_empty_full_and_invalid_ranges() {
         use std::ops::Bound::{Excluded, Included, Unbounded};
 
         assert!(Buffer::new().take_bytes(.., 0).is_empty());
+        assert!(Buffer::new().take_split_view(.., 0).is_empty());
         let mut buffer = Buffer::new();
         buffer.extend_from_slice(b"abcdef");
         assert!(buffer.take_bytes(2..2, 1).is_empty());
@@ -1592,18 +1650,29 @@ mod test {
                 buffer.buf.len(),
                 buffer.capacity(),
             );
-            assert!(catch_unwind(AssertUnwindSafe(|| buffer.take_bytes(range, addition))).is_err());
-            assert_eq!(buffer.buffer(), b"abcdef");
-            assert_eq!(buffer.buffer().as_ptr(), address);
-            assert_eq!(
-                (
-                    buffer.consumed,
-                    (buffer.consumed + buffer.buffered),
-                    buffer.buf.len(),
-                    buffer.capacity()
-                ),
-                state,
-            );
+            for borrowed in [true, false] {
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| {
+                        if borrowed {
+                            buffer.take_split_view(range, addition);
+                        } else {
+                            buffer.take_bytes(range, addition);
+                        }
+                    }))
+                    .is_err()
+                );
+                assert_eq!(buffer.buffer(), b"abcdef");
+                assert_eq!(buffer.buffer().as_ptr(), address);
+                assert_eq!(
+                    (
+                        buffer.consumed,
+                        buffer.consumed + buffer.buffered,
+                        buffer.buf.len(),
+                        buffer.capacity(),
+                    ),
+                    state,
+                );
+            }
         }
     }
 
@@ -2673,7 +2742,7 @@ mod test {
     }
 
     #[test]
-    fn take_view_accepts_slice_ranges_without_copying_or_coupling_consumption() {
+    fn take_views_accept_ranges_without_copying() {
         fn check<I: std::ops::RangeBounds<usize> + Clone>(range: I, start: usize, end: usize) {
             for consume in [0, 2, 6] {
                 let mut buffer = Buffer::with_capacity(32);
@@ -2684,6 +2753,16 @@ mod test {
                 assert_eq!(view, &b"abcdef"[start..end]);
                 assert_eq!(view.as_ptr(), address.wrapping_add(start));
                 assert_eq!(buffer.buffer(), &b"abcdef"[consume..]);
+            }
+            for addition in 0..=6 - end {
+                let mut buffer = Buffer::with_capacity(32);
+                buffer.extend_from_slice(b"old:abcdef");
+                buffer.consume(4);
+                let address = buffer.buffer().as_ptr();
+                let view = buffer.take_split_view(range.clone(), addition);
+                assert_eq!(view, &b"abcdef"[start..end]);
+                assert_eq!(view.as_ptr(), address.wrapping_add(start));
+                assert_eq!(buffer.buffer(), &b"abcdef"[end + addition..]);
             }
         }
         check(.., 0, 6);
