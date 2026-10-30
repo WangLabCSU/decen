@@ -25,7 +25,7 @@ which adapts asynchronous I/O into `Stream` and `Sink` transports. decen focuses
 on efficient frame processing through `std::io::Read` and `std::io::Write`,
 emphasizing memory reuse and control over the ownership of decoded data.
 
-Borrow framed bytes for immediate processing, retain them without copying, or
+Borrow framed bytes for immediate processing, retain their owned storage, or
 build an owned Item containing only the data you need. A single framing
 implementation can support all three modes.
 
@@ -44,20 +44,26 @@ bytes as needed, asks the framer to select a complete frame, and passes the
 framed bytes to the decoder. An Item can be a parsed record rather than a byte
 container.
 
-| Trait          | Decoder input | Example Item       | Reader method    |
-| -------------- | ------------- | ------------------ | ---------------- |
-| `ViewDecoder`  | `&'a [u8]`    | `Record<&'a [u8]>` | `decode_view()`  |
-| `OwnedDecoder` | `&[u8]`       | `Record<Vec<u8>>`  | `decode_owned()` |
-| `BytesDecoder` | `BytesMut`    | `Record<Bytes>`    | `decode_bytes()` |
+| Trait          | Decoder input     | Reader method    |
+| -------------- | ----------------- | ---------------- |
+| `ViewDecoder`  | `&'a [u8]`        | `decode_view()`  |
+| `OwnedDecoder` | `Segments<&[u8]>` | `decode_owned()` |
+| `BytesDecoder` | `BytesMut`        | `decode_bytes()` |
 
-- `decode_view()` lets the Item borrow framed bytes without copying, making it
-  suitable for processing an Item before reading the next one.
-- `decode_owned()` passes framed bytes as a slice, but the Item cannot borrow
-  from it. The decoder explicitly copies any input data the Item needs to
-  retain. Parsed values need no copy of the input bytes.
-- `decode_bytes()` passes framed bytes directly as an owned `BytesMut`. The
-  Item can retain those bytes across reads, allowing zero-copy decoding
-  without borrowing from the reader.
+`Framer` receives `Segments<&[u8]>`: either `Contiguous(data)` or
+`Split(first, second)`. The parts are consecutive bytes of the same input;
+frame offsets refer to both parts in order. Inspecting them does not copy.
+
+- `decode_view()` passes a continuous slice that the Item can borrow until the
+  next read. Frames crossing the two input parts are joined before decoding,
+  which can allocate and copy; frames within one part are borrowed directly.
+- `decode_owned()` passes the selected parts without joining them. The decoder
+  can copy just the fields needed into the final Item. Parsed values need no
+  copy of the input bytes.
+- `decode_bytes()` passes an owned `BytesMut` that the Item can retain. With
+  `ready_split`, frames within one input part are transferred without copying;
+  frames crossing parts are joined, which copies bytes. `ready_copy` copies
+  the selected bytes into an owned buffer.
 
 Although a `ViewDecoder` Item can be fully owned, using this trait for results
 that do not borrow the input is discouraged. Implement `OwnedDecoder` instead.
@@ -88,8 +94,8 @@ Implement `Encoder<Item>` to write an Item's encoded bytes.
 `Framer::frame` returns a `Frame` describing the next action.
 
 - `ready_split(range, addition)`: Selects `range` and consumes through its end
-  plus `addition` bytes; `decode_bytes()` transfers the selection without
-  copying.
+  plus `addition` bytes; `decode_bytes()` transfers selections within one input
+  part without copying and joins selections crossing parts.
 - `ready_copy(range, consume)`: Selects `range` independently of consuming the
   first `consume` bytes, allowing adjacent frames to overlap; `decode_bytes()`
   copies the framed bytes.
@@ -106,8 +112,7 @@ resumes framing. `need_more(consume)` attempts a read before framing again.
 
 The decoder receives framed bytes. A view Item can borrow fields directly;
 converted fields, such as unescaped text, can use storage owned by the Item.
-`BytesDecoder` can return `BytesMut` directly or freeze it into `Bytes`. A
-record can also hold the frame and expose its fields as slices.
+`BytesDecoder` can retain the `BytesMut` directly or freeze it into `Bytes`.
 
 ## Example
 
@@ -120,7 +125,8 @@ use std::io::{self, Cursor};
 
 use bytes::BytesMut;
 use decen::read::{
-    BytesDecoder, Frame, FramedRead, Framer, OwnedDecoder, ViewDecoder,
+    BytesDecoder, Frame, FramedRead, Framer, OwnedDecoder, Segments,
+    ViewDecoder,
 };
 use decen::write::{Encoder, FramedWrite};
 
@@ -129,7 +135,7 @@ struct ByteCodec;
 impl Framer for ByteCodec {
     type Error = io::Error;
 
-    fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+    fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
         Ok(if src.is_empty() {
             Frame::need_more(0)
         } else {
@@ -160,7 +166,10 @@ impl ViewDecoder for ByteCodec {
 impl OwnedDecoder for ByteCodec {
     type Item = Vec<u8>;
 
-    fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
+    fn decode_owned(
+        &mut self,
+        frame: Segments<&[u8]>,
+    ) -> io::Result<Self::Item> {
         Ok(frame.to_vec())
     }
 }
@@ -200,7 +209,8 @@ fn main() -> io::Result<()> {
     let copied = reader.decode_owned()?.unwrap();
     writer.write(&copied)?;
     assert!(reader.decode_view()?.is_none());
-    assert_eq!(&owned[..], b"\0"); // Owned Items can be retained across reads.
+    // Owned Items can be retained across reads.
+    assert_eq!(&owned[..], b"\0");
     assert_eq!(copied, b"\x01");
 
     writer.flush()?;

@@ -18,6 +18,9 @@ destinations. `FramedRead` tracks initialized spare space; direct `BytesMut`
 initializes its tail on each refill. With `nightly`, both use `Read::read_buf`.
 
 Read compares `FramedRead`, `BufReader`, and direct `BytesMut` buffering.
+`FramedRead` retains partial frames separately and refills whole chunks.
+`decode_view()` joins crossing frames; `decode_owned()` copies the selected
+parts directly into its result.
 Write compares `FramedWrite` and `BufWriter`.
 
 | Workload              | Item sizes             |
@@ -42,7 +45,8 @@ Reading the tables:
   Green marks the lowest median within each comparison group.
 - Read tables also show `median MiB/s`; higher throughput is better.
 - Read rows are grouped by source and result type: borrowed slice, `Vec<u8>`,
-  or `BytesMut`. Write rows are grouped by sink.
+  or owned bytes. Both owned-byte paths return one contiguous `BytesMut`.
+  Write rows are grouped by sink.
 - `Lines` keeps partial lines in the reader; `AccumulatingLines` stores them
   in its own `Vec`. `false` transfers that Vec; `true` copies it and reuses it.
 

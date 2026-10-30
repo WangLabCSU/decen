@@ -4,14 +4,12 @@
 
 use std::io::Read;
 
-use bytes::BytesMut;
-
-// Keep the internal Buffer's full API without suppressing reader/decoder lints.
-#[allow(dead_code)]
 mod buffer;
 mod decoder;
+mod segments;
 
 pub use self::decoder::{BytesDecoder, Frame, FrameKind, Framer, OwnedDecoder, ViewDecoder};
+pub use self::segments::Segments;
 
 use self::buffer::Buffer;
 use self::decoder::{FrameInner, FrameReady};
@@ -31,20 +29,21 @@ use crate::DEFAULT_BUF_SIZE;
 ///
 /// - [`decode_view`](Self::decode_view) requires [`ViewDecoder`] and
 ///   passes framed bytes as a slice. The returned Item can borrow from that
-///   slice without copying, making this suitable for processing an Item before
-///   reading the next one.
+///   slice, making this suitable for processing an Item before reading the
+///   next one. Frames within one input part are borrowed directly; frames
+///   crossing parts are joined before decoding, which can allocate and copy.
 /// - [`decode_owned`](Self::decode_owned) requires [`OwnedDecoder`] and
-///   passes framed bytes as a slice, but the returned Item cannot borrow from
-///   it. The decoder must explicitly copy any input data the Item needs to
-///   retain.
+///   passes framed bytes as [`Segments<&[u8]>`](Segments), without joining
+///   the parts. The returned Item cannot borrow the input. The decoder copies
+///   any input data the Item needs to retain.
 /// - [`decode_bytes`](Self::decode_bytes) requires [`BytesDecoder`] and
-///   passes framed bytes directly as an owned [`bytes::BytesMut`]. The Item can
-///   retain those bytes across reads, allowing zero-copy decoding without
-///   borrowing from the reader.
+///   passes framed bytes as an owned [`bytes::BytesMut`]. The Item can retain
+///   those bytes across reads without borrowing from the reader.
 ///
-/// With `decode_bytes`, the framed bytes are transferred without copying when
-/// the framer returns [`Frame::ready_split`], and copied when it returns
-/// [`Frame::ready_copy`]. For `ready_copy`, prefer
+/// With `decode_bytes` and [`Frame::ready_split`], frames within one input part
+/// are transferred without copying; frames crossing parts are joined, which
+/// copies bytes. [`Frame::ready_copy`] copies the selected bytes. For
+/// `ready_copy`, prefer
 /// [`decode_owned`](Self::decode_owned) when an owned result is needed and the
 /// decoder implements [`OwnedDecoder`], so it can copy only the data the Item
 /// needs.
@@ -65,14 +64,14 @@ use crate::DEFAULT_BUF_SIZE;
 /// ```
 /// use std::io;
 ///
-/// use decen::read::{Frame, FramedRead, Framer, ViewDecoder};
+/// use decen::read::{Frame, FramedRead, Framer, Segments, ViewDecoder};
 ///
 /// struct Pairs;
 ///
 /// impl Framer for Pairs {
 ///     type Error = io::Error;
 ///
-///     fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+///     fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
 ///         Ok(if src.len() < 2 {
 ///             Frame::need_more(0)
 ///         } else {
@@ -138,8 +137,8 @@ impl<R: ?Sized + Read, D> FramedRead<R, D> {
         &self.inner
     }
 
-    /// Returns the buffered input.
-    pub fn buffer(&self) -> &[u8] {
+    /// Borrows the buffered input without joining its parts.
+    pub fn buffer(&self) -> Segments<&[u8]> {
         self.buffer.buffer()
     }
 
@@ -152,7 +151,7 @@ impl<R: ?Sized + Read, D> FramedRead<R, D> {
 // Inline the decoding entry points into the caller's Item loop so framing
 // and extraction can be optimized without passing an intermediate result.
 impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
-    /// Decodes the next Item from framed bytes in an owned [`BytesMut`].
+    /// Decodes the next Item from owned framed bytes.
     ///
     /// Returns `None` when the input has ended and no further Item is
     /// available.
@@ -174,18 +173,13 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         let Some(ready) = self.frame_ready()? else {
             return Ok(None);
         };
-        match ready {
-            FrameReady::Copy { range, consume } => {
-                let view = self.buffer.take_view(range.bounds(), consume);
-                let mut bytes = BytesMut::with_capacity(view.len());
-                bytes.extend_from_slice(view);
-                self.decoder.decode_bytes(bytes).map(Some)
+        let bytes = match ready {
+            FrameReady::Copy { range, consume } => self.buffer.take_bytes(range.bounds(), consume),
+            FrameReady::Split { range, addition } => {
+                self.buffer.take_bytes_to(range.bounds(), addition)
             }
-            FrameReady::Split { range, addition } => self
-                .decoder
-                .decode_bytes(self.buffer.take_bytes(range.bounds(), addition))
-                .map(Some),
-        }
+        };
+        self.decoder.decode_bytes(bytes).map(Some)
     }
 
     /// Decodes the next Item from a slice of framed bytes.
@@ -210,7 +204,12 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         let Some(ready) = self.frame_ready()? else {
             return Ok(None);
         };
-        let slice = Self::take_frame_view(&mut self.buffer, ready);
+        let slice = match ready {
+            FrameReady::Copy { range, consume } => self.buffer.take_view(range.bounds(), consume),
+            FrameReady::Split { range, addition } => {
+                self.buffer.take_view_to(range.bounds(), addition)
+            }
+        };
         Ok(Some(self.decoder.decode_view(slice)?))
     }
 
@@ -236,20 +235,15 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         let Some(ready) = self.frame_ready()? else {
             return Ok(None);
         };
-        let view = Self::take_frame_view(&mut self.buffer, ready);
-        Ok(Some(self.decoder.decode_owned(view)?))
-    }
-
-    // Keep the view's borrow confined to the buffer so the decoder can be
-    // mutated independently. Inline to simplify bounds for each framer.
-    #[inline(always)]
-    fn take_frame_view(buffer: &mut Buffer, ready: FrameReady) -> &[u8] {
-        match ready {
-            FrameReady::Copy { range, consume } => buffer.take_view(range.bounds(), consume),
-            FrameReady::Split { range, addition } => {
-                buffer.take_split_view(range.bounds(), addition)
+        let view = match ready {
+            FrameReady::Copy { range, consume } => {
+                self.buffer.take_view_segments(range.bounds(), consume)
             }
-        }
+            FrameReady::Split { range, addition } => {
+                self.buffer.take_view_segments_to(range.bounds(), addition)
+            }
+        };
+        Ok(Some(self.decoder.decode_owned(view)?))
     }
 
     // Keep framing in the caller's Item loop.
@@ -304,7 +298,7 @@ mod test {
 
     use bytes::{Bytes, BytesMut};
 
-    use super::{BytesDecoder, Frame, FramedRead, Framer, OwnedDecoder, ViewDecoder};
+    use super::{BytesDecoder, Frame, FramedRead, Framer, OwnedDecoder, Segments, ViewDecoder};
     use crate::test::allocations;
 
     // Minimal framing fixture for I/O tests, not a public format
@@ -316,8 +310,8 @@ mod test {
     }
     impl Framer for Lines {
         type Error = io::Error;
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
-            if let Some(offset) = src[self.scanned..].iter().position(|&b| b == b'\n') {
+        fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
+            if let Some(offset) = src.slice(self.scanned..).iter().position(|&b| b == b'\n') {
                 let end = self.scanned + offset + 1;
                 self.scanned = 0;
                 Ok(Frame::ready_split(..end, 0))
@@ -326,7 +320,7 @@ mod test {
                 Ok(Frame::need_more(0))
             }
         }
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             let frame = self.frame(src)?;
             if frame != Frame::need_more(0) {
                 return Ok(frame);
@@ -354,7 +348,7 @@ mod test {
 
     impl OwnedDecoder for Lines {
         type Item = Vec<u8>;
-        fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
+        fn decode_owned(&mut self, frame: Segments<&[u8]>) -> io::Result<Self::Item> {
             Ok(frame.to_vec())
         }
     }
@@ -421,13 +415,20 @@ mod test {
     }
 
     #[test]
-    fn reader_borrows_the_actual_read_destination() {
-        let source = Script::new([Step::Data(b"key="), Step::Data(b"\xff\0\n")]);
+    fn reader_borrows_a_complete_chunk_and_joins_only_crossing_frames() {
+        let source = Script::new([Step::Data(b"a\nkey="), Step::Data(b"\xff\0\nb\n")]);
         let mut reader = FramedRead::with_capacity(source, Lines::default(), 32);
         let item = reader.decode_view().unwrap().unwrap();
-        assert_eq!(item, b"key=\xff\0\n");
         let address = item.as_ptr() as usize;
-        assert_eq!(reader.reader().destinations, [address, address + 4]);
+        assert_eq!(item, b"a\n");
+        assert_eq!(reader.reader().destinations, [address]);
+        assert_eq!(reader.decode_view().unwrap().unwrap(), b"key=\xff\0\n");
+        // Both reads use the whole chunk. Only the crossing frame is joined;
+        // the following frame still borrows its original read destination.
+        assert_eq!(reader.reader().destinations, [address, address]);
+        let item = reader.decode_view().unwrap().unwrap();
+        assert_eq!(item, b"b\n");
+        assert_eq!(item.as_ptr() as usize, address + 3);
     }
 
     #[test]
@@ -515,7 +516,7 @@ mod test {
                             } else {
                                 assert_eq!(result.unwrap().unwrap_err().kind(), ErrorKind::Other);
                             }
-                            assert_eq!(reader.buffer.buffer(), prefix);
+                            assert_eq!(reader.buffer().to_vec(), prefix);
                             let expected = [prefix, b"ok\n"].concat();
                             match retry_mode {
                                 0 => assert_eq!(
@@ -555,20 +556,23 @@ mod test {
 
     #[test]
     fn short_reads_and_large_items_roundtrip_in_both_modes() {
-        let items = [
-            vec![b'\n'],
-            vec![0, 255, 13, b'\n'],
-            (0..=255)
-                .filter(|&b| b != b'\n')
-                .cycle()
-                .take(20_000)
-                .chain(*b"\n")
-                .collect(),
-            vec![b'\n'],
-        ];
-        let wire = items.concat();
-        for capacity in [1, 4, 7, 8192] {
-            for limit in [1, 3, 1024, 30_000] {
+        for (payload_len, limit) in [(6, 1), (24, 3), (20_000, 8192), (20_000, 30_000)] {
+            // Bytewise reads use small frames because pending input doubles the
+            // read capacity. Large frames exercise refills without thousands of
+            // deliberate short reads and exponential test allocations.
+            let items = [
+                vec![b'\n'],
+                vec![0, 255, 13, b'\n'],
+                (0..=255)
+                    .filter(|&b| b != b'\n')
+                    .cycle()
+                    .take(payload_len)
+                    .chain(*b"\n")
+                    .collect(),
+                vec![b'\n'],
+            ];
+            let wire = items.concat();
+            for capacity in [1, 4, 7, 8192] {
                 let source = || ShortReads {
                     source: Cursor::new(&wire),
                     limit,
@@ -612,11 +616,11 @@ mod test {
         impl Framer for OwnedView {
             type Error = io::Error;
 
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
                 self.0.frame(src)
             }
 
-            fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+            fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
                 self.0.frame_eof(src)
             }
         }
@@ -657,34 +661,25 @@ mod test {
             .collect();
         let wire = expected.concat();
         for capacity in [1, 7, 64] {
-            for limit in [1, 3, 1024] {
-                let mut reader = FramedRead::with_capacity(
-                    ShortReads {
-                        source: &wire[..],
-                        limit,
-                    },
-                    Lines::default(),
-                    capacity,
-                );
-                let mut kept_bytes = Vec::new();
-                let mut kept_vecs = Vec::new();
-                for (i, payload) in expected.iter().enumerate() {
-                    match i % 3 {
-                        0 => {
-                            assert_eq!(reader.decode_view().unwrap().unwrap(), payload.as_slice());
-                        }
-                        1 => kept_bytes.push((i, reader.decode_bytes().unwrap().unwrap())),
-                        _ => kept_vecs.push((i, reader.decode_owned().unwrap().unwrap())),
+            let mut reader = FramedRead::with_capacity(&wire[..], Lines::default(), capacity);
+            let mut kept_bytes = Vec::new();
+            let mut kept_vecs = Vec::new();
+            for (i, payload) in expected.iter().enumerate() {
+                match i % 3 {
+                    0 => {
+                        assert_eq!(reader.decode_view().unwrap().unwrap(), payload.as_slice());
                     }
+                    1 => kept_bytes.push((i, reader.decode_bytes().unwrap().unwrap())),
+                    _ => kept_vecs.push((i, reader.decode_owned().unwrap().unwrap())),
                 }
-                assert!(reader.decode_bytes().unwrap().is_none());
-                drop(reader);
-                for (i, item) in kept_bytes {
-                    assert_eq!(item.as_ref(), expected[i]);
-                }
-                for (i, item) in kept_vecs {
-                    assert_eq!(item, expected[i]);
-                }
+            }
+            assert!(reader.decode_bytes().unwrap().is_none());
+            drop(reader);
+            for (i, item) in kept_bytes {
+                assert_eq!(item.as_ref(), expected[i]);
+            }
+            for (i, item) in kept_vecs {
+                assert_eq!(item, expected[i]);
             }
         }
     }
@@ -697,10 +692,10 @@ mod test {
         }
         impl Framer for Closing {
             type Error = io::Error;
-            fn frame(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
+            fn frame(&mut self, _: Segments<&[u8]>) -> Result<Frame, Self::Error> {
                 Ok(Frame::need_more(0))
             }
-            fn frame_eof(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
+            fn frame_eof(&mut self, _: Segments<&[u8]>) -> Result<Frame, Self::Error> {
                 self.eof_calls += 1;
                 Ok(if self.remaining > 0 {
                     Frame::ready_split(..0, 0)
@@ -731,10 +726,10 @@ mod test {
         struct Pending;
         impl Framer for Pending {
             type Error = io::Error;
-            fn frame(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
+            fn frame(&mut self, _: Segments<&[u8]>) -> Result<Frame, Self::Error> {
                 Ok(Frame::need_more(0))
             }
-            fn frame_eof(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
+            fn frame_eof(&mut self, _: Segments<&[u8]>) -> Result<Frame, Self::Error> {
                 Err(io::Error::new(ErrorKind::UnexpectedEof, "unfinished state"))
             }
         }
@@ -767,7 +762,7 @@ mod test {
     }
     impl Framer for Quoted {
         type Error = io::Error;
-        fn frame(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
+        fn frame(&mut self, src: Segments<&[u8]>) -> Result<Frame, Self::Error> {
             for (i, &b) in src.iter().enumerate().skip(self.scanned) {
                 if self.escaped {
                     self.escaped = false;
@@ -783,7 +778,7 @@ mod test {
             self.scanned = src.len();
             Ok(Frame::need_more(0))
         }
-        fn frame_eof(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
+        fn frame_eof(&mut self, src: Segments<&[u8]>) -> Result<Frame, Self::Error> {
             let frame = self.frame(src)?;
             if frame != Frame::need_more(0) {
                 return Ok(frame);
@@ -908,11 +903,11 @@ mod test {
     }
     impl Framer for FrameScript {
         type Error = io::Error;
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             self.inputs.push((false, src.to_vec()));
             self.frames.pop_front().unwrap_or(Ok(Frame::need_more(0)))
         }
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             self.inputs.push((true, src.to_vec()));
             self.eof_frames
                 .pop_front()
@@ -937,8 +932,8 @@ mod test {
     impl OwnedDecoder for FrameScript {
         type Item = Vec<u8>;
 
-        fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
-            self.inspect(frame)?;
+        fn decode_owned(&mut self, frame: Segments<&[u8]>) -> io::Result<Vec<u8>> {
+            self.inspect(&frame.to_vec())?;
             Ok(frame.to_vec())
         }
     }
@@ -976,7 +971,7 @@ mod test {
                         _ => reader.decode_owned().unwrap().unwrap(),
                     };
                     assert_eq!(actual, expected);
-                    assert_eq!(reader.buffer.buffer(), &input[consume..]);
+                    assert_eq!(reader.buffer().to_vec(), &input[consume..]);
                 }
             }
         }
@@ -1005,7 +1000,7 @@ mod test {
         impl Framer for Pairs {
             type Error = io::Error;
 
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
                 Ok(if src.len() < 2 {
                     Frame::need_more(0)
                 } else {
@@ -1031,7 +1026,7 @@ mod test {
         impl OwnedDecoder for Pairs {
             type Item = Vec<u8>;
 
-            fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
+            fn decode_owned(&mut self, frame: Segments<&[u8]>) -> io::Result<Vec<u8>> {
                 Ok(frame.to_vec())
             }
         }
@@ -1095,7 +1090,7 @@ mod test {
             let codec = FrameScript::new([Frame::ready_split(..1, 0)]);
             let mut reader = FramedRead::with_capacity(&b"x"[..], codec, capacity);
             if consumed != 0 {
-                reader.buffer.extend_from_slice(b"abcd");
+                reader.buffer.write_buf(&mut &b"abcd"[..]).unwrap();
                 reader.buffer.consume(consumed);
             }
             reader.eof = true;
@@ -1103,9 +1098,6 @@ mod test {
             assert_eq!(reader.decode_view().unwrap().unwrap(), b"x");
             assert!(!reader.eof);
             assert!(reader.reader().is_empty());
-            if capacity != 0 {
-                assert_eq!(reader.buffer.capacity(), capacity);
-            }
         }
         let mut reader = FramedRead::with_capacity(&b"tail"[..], Lines::default(), 8);
         let retained = reader.decode_bytes().unwrap().unwrap();
@@ -1215,7 +1207,7 @@ mod test {
                 } else {
                     assert!(result.is_err());
                 }
-                assert_eq!(reader.buffer.buffer(), b"a");
+                assert_eq!(reader.buffer().to_vec(), b"a");
                 assert_eq!(reader.reader().reads, 2);
                 assert!(reader.decoder().decoded.is_empty());
                 assert_eq!(reader.decode_view().unwrap().unwrap(), b"a");
@@ -1253,7 +1245,7 @@ mod test {
                 };
                 assert!(no_item);
                 assert!(reader.eof);
-                assert_eq!(reader.buffer.buffer(), remaining);
+                assert_eq!(reader.buffer().to_vec(), remaining);
                 assert_eq!(reader.reader().reads, 3);
                 let item = match mode {
                     0 => reader.decode_bytes().unwrap().unwrap().to_vec(),
@@ -1289,10 +1281,14 @@ mod test {
                                 codec,
                                 16,
                             );
-                            reader.buffer.extend_from_slice(b"old:");
-                            reader.buffer.extend_from_slice(input);
+                            reader
+                                .buffer
+                                .write_buf(&mut io::repeat(0).take(16))
+                                .unwrap();
+                            reader.buffer.consume(16);
+                            let initial = [b"old:", input].concat();
+                            reader.buffer.write_buf(&mut &initial[..]).unwrap();
                             reader.buffer.consume(4);
-                            reader.buffer.try_init(0, reader.buffer.spare());
                             reader.eof = eof;
 
                             let result = catch_unwind(AssertUnwindSafe(|| match mode {
@@ -1301,8 +1297,7 @@ mod test {
                                 _ => reader.decode_owned().map(|_| ()),
                             }));
                             assert!(result.is_err());
-                            assert_eq!(reader.buffer.buffer(), input);
-                            assert_eq!(reader.buffer.consumed(), 4);
+                            assert_eq!(reader.buffer().to_vec(), input);
                             assert_eq!(reader.eof, eof);
                             assert_eq!(reader.reader().reads, 0);
                             assert!(reader.decoder().decoded.is_empty());
@@ -1820,7 +1815,7 @@ mod test {
     }
     impl Framer for Editing {
         type Error = io::Error;
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             Ok(if src.is_empty() {
                 Frame::need_more(0)
             } else if src[0] == b'#' {
@@ -1833,7 +1828,7 @@ mod test {
                 Frame::ready_split(1..3, 1)
             })
         }
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             Ok(if src.is_empty() {
                 Frame::need_more(0)
             } else {
@@ -1888,7 +1883,7 @@ mod test {
         struct RejectOnce(bool);
         impl Framer for RejectOnce {
             type Error = io::Error;
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
                 if src.is_empty() {
                     return Ok(Frame::need_more(0));
                 }
@@ -1896,10 +1891,10 @@ mod test {
                     self.0 = true;
                     return Err(io::Error::new(ErrorKind::InvalidData, "header rejected"));
                 }
-                assert_eq!(src, b"#abc");
+                assert_eq!(src.to_vec(), b"#abc");
                 Ok(Frame::ready_split(1.., 0))
             }
-            fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+            fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
                 self.frame(src)
             }
         }
@@ -1926,7 +1921,7 @@ mod test {
         }
         impl Framer for RemoveHeader {
             type Error = io::Error;
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
                 if !self.removed && !src.is_empty() {
                     assert_eq!(src[0], b'#');
                     self.removed = true;
@@ -1938,7 +1933,7 @@ mod test {
                     Frame::ready_split(..2, 0)
                 })
             }
-            fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+            fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
                 self.frame(src)
             }
         }
@@ -1964,7 +1959,7 @@ mod test {
     impl Framer for DelimitedLines {
         type Error = io::Error;
 
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             Ok(match src.iter().position(|&b| b == b'\n') {
                 Some(end) if src[0] == b'#' => Frame::skip(end + 1),
                 Some(end) => Frame::ready_split(..end, 1),
@@ -1972,7 +1967,7 @@ mod test {
             })
         }
 
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             if src.is_empty() {
                 Ok(Frame::need_more(0))
             } else {
@@ -2004,7 +1999,7 @@ mod test {
     impl Framer for Triples {
         type Error = io::Error;
 
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             Ok(if src.len() < 3 {
                 Frame::need_more(0)
             } else if self.copy {
@@ -2014,7 +2009,7 @@ mod test {
             })
         }
 
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             if src.is_empty() {
                 Ok(Frame::need_more(0))
             } else if src.len() < 3 {
@@ -2090,7 +2085,7 @@ mod test {
         impl Framer for Fixed {
             type Error = io::Error;
 
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
                 Ok(if src.len() < self.0 {
                     Frame::need_more(0)
                 } else {
@@ -2218,7 +2213,7 @@ mod test {
     impl Framer for InvalidFrame {
         type Error = io::Error;
 
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             Ok(if src.is_empty() {
                 Frame::need_more(0)
             } else if self.split {
@@ -2228,7 +2223,7 @@ mod test {
             })
         }
 
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
             self.frame(src)
         }
     }

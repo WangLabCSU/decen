@@ -16,7 +16,9 @@ use std::mem;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BytesMut};
-use decen::read::{BytesDecoder, Frame, FrameKind, FramedRead, Framer, OwnedDecoder, ViewDecoder};
+use decen::read::{
+    BytesDecoder, Frame, FrameKind, FramedRead, Framer, OwnedDecoder, Segments, ViewDecoder,
+};
 use memchr::memchr;
 
 #[path = "src/table.rs"]
@@ -77,14 +79,32 @@ fn finish_owned<const REUSE: bool>(partial: &mut Vec<u8>, frame: &[u8]) -> Vec<u
 struct Lines<const COPY: bool>(usize);
 impl<const COPY: bool> Framer for Lines<COPY> {
     type Error = io::Error;
-    fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
-        Ok(match self.line_end(src) {
+    fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
+        Ok(match self.line_end_input(src) {
             Some(end) => Self::ready(end),
             None => Frame::need_more(0),
         })
     }
 }
 impl<const COPY: bool> Lines<COPY> {
+    #[inline(always)]
+    fn line_end_input(&mut self, src: Segments<&[u8]>) -> Option<usize> {
+        if let Segments::Contiguous(data) = src {
+            return self.line_end(data);
+        }
+        let suffix = src.slice(self.0..);
+        let (prefix, data) = suffix.parts();
+        let end =
+            find_line_end(prefix).or_else(|| find_line_end(data).map(|end| prefix.len() + end));
+        if let Some(end) = end {
+            let end = self.0 + end;
+            self.0 = 0;
+            Some(end)
+        } else {
+            self.0 = src.len();
+            None
+        }
+    }
     // Share this scanner with the direct BytesMut baseline so only buffering
     // and frame delivery differ, not the LF search or partial-line bookkeeping.
     #[inline(always)]
@@ -141,8 +161,8 @@ impl<const COPY: bool> ViewDecoder for Lines<COPY> {
 }
 impl<const COPY: bool> OwnedDecoder for Lines<COPY> {
     type Item = Vec<u8>;
-    fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
-        Ok(copy_frame(frame))
+    fn decode_owned(&mut self, frame: Segments<&[u8]>) -> io::Result<Self::Item> {
+        Ok(frame.to_vec())
     }
 }
 
@@ -157,16 +177,24 @@ struct AccumulatingLines<const REUSE: bool> {
 impl<const REUSE: bool> Framer for AccumulatingLines<REUSE> {
     type Error = io::Error;
 
-    fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
-        if let Some(end) = find_line_end(src) {
+    fn frame(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
+        let end = match src {
+            Segments::Contiguous(data) => find_line_end(data),
+            Segments::Split(first, second) => {
+                find_line_end(first).or_else(|| find_line_end(second).map(|end| first.len() + end))
+            }
+        };
+        if let Some(end) = end {
             Ok(Frame::ready_split(..end, 0))
         } else {
-            self.partial.extend_from_slice(src);
+            let (first, second) = src.parts();
+            self.partial.extend_from_slice(first);
+            self.partial.extend_from_slice(second);
             Ok(Frame::need_more(src.len()))
         }
     }
 
-    fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+    fn frame_eof(&mut self, src: Segments<&[u8]>) -> io::Result<Frame> {
         let frame = self.frame(src)?;
         // The default EOF check cannot see bytes already consumed into partial.
         if frame.kind() == FrameKind::NeedMore && !self.partial.is_empty() {
@@ -182,8 +210,14 @@ impl<const REUSE: bool> Framer for AccumulatingLines<REUSE> {
 impl<const REUSE: bool> OwnedDecoder for AccumulatingLines<REUSE> {
     type Item = Vec<u8>;
 
-    fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
-        Ok(finish_owned::<REUSE>(&mut self.partial, frame))
+    fn decode_owned(&mut self, frame: Segments<&[u8]>) -> io::Result<Self::Item> {
+        match frame {
+            Segments::Contiguous(data) => Ok(finish_owned::<REUSE>(&mut self.partial, data)),
+            Segments::Split(first, second) => {
+                self.partial.extend_from_slice(first);
+                Ok(finish_owned::<REUSE>(&mut self.partial, second))
+            }
+        }
     }
 }
 
@@ -406,8 +440,8 @@ fn compare<R: Read + Seek>(
     for values in &mut times {
         values.sort_by(f64::total_cmp);
     }
-    // Compare identical output types; Vec and BytesMut have different
-    // ownership and allocation costs even though both own their bytes.
+    // Group by ownership: borrowed slices, copied Vecs, or owned BytesMut
+    // storage. Both owned-byte paths return one contiguous BytesMut.
     let borrowed_best = [1, 2, 4, 7]
         .into_iter()
         .map(|mode| times[mode][SAMPLES / 2])
@@ -424,7 +458,7 @@ fn compare<R: Read + Seek>(
         let values = &times[mode];
         let (item, best) = match mode {
             1 | 2 | 4 | 7 => ("borrowed", borrowed_best),
-            0 | 9 => ("BytesMut", bytes_best),
+            0 | 9 => ("owned bytes", bytes_best),
             _ => ("Vec<u8>", vec_best),
         };
         rows.push(table::Row {
@@ -563,17 +597,18 @@ fn main() -> io::Result<()> {
              Rewinding and content verification are outside timing."
         );
         println!(
-            "BufReader keeps its fixed capacity; the other buffers can grow. \
+            "BufReader and FramedRead refill whole chunks; partial frames use scratch. \
              Read request sizes can differ, and no artificial short-read limit is applied."
         );
         println!(
             "Framing: decode_view compares ready_split(..end, 0) with \
-             ready_copy(..end, end); both return borrowed slices without \
-             copying. decode_bytes and decode_owned use ready_split(..end, 0)."
+             ready_copy(..end, end); both join only frames crossing reads. \
+             decode_bytes and decode_owned use ready_split(..end, 0)."
         );
         println!(
-            "All explicit framing paths share find_line_end(); all fresh Vec \
-             copies share copy_frame(). The borrowed fill_buf path reuses \
+            "All explicit framing paths share find_line_end(). Contiguous \
+             Vec results use to_vec(); split input copies both parts directly \
+             into the final Vec. The borrowed fill_buf path reuses \
              scratch for frames crossing reads. The two owned fill_buf paths \
              share finish_owned::<REUSE>() with AccumulatingLines. read_until \
              uses its own standard-library framing and a fresh Vec per Item."
