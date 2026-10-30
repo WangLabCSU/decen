@@ -162,7 +162,8 @@ impl Frame {
     ///
     /// Use `need_more(0)` to retain all current input. The reader attempts a
     /// read before calling the framer again, even if some input remains.
-    /// Consumption is not rolled back if reading returns zero, fails, or panics.
+    /// Consumption is not rolled back if reading returns zero, fails, or
+    /// panics.
     ///
     /// # Contract
     ///
@@ -219,8 +220,8 @@ pub trait Framer {
     ///
     /// When more bytes are needed, return [`Frame::need_more`] to request more
     /// input. This decision can also consume bytes before reading:
-    /// `Frame::need_more(consume)` consumes the first `consume` bytes and retains
-    /// the rest of `src`. `Frame::need_more(0)` retains all of `src`.
+    /// `Frame::need_more(consume)` consumes the first `consume` bytes and
+    /// retains the rest of `src`. `Frame::need_more(0)` retains all of `src`.
     ///
     /// Each decision must satisfy its constructor's contract. Adjust saved
     /// scan offsets to account for consumed bytes, which are no longer part

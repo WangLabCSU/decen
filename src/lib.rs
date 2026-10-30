@@ -1,5 +1,9 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    feature = "nightly",
+    feature(borrowed_buf_init, core_io_borrowed_buf, read_buf)
+)]
 
 pub mod read;
 pub mod write;

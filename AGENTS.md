@@ -86,8 +86,8 @@ mod tests;
 
 - Do not make a field `pub` if doing so would allow callers to violate the
   object's invariants.
-- Follow the ownership-boundary guidance in [Rust notes:
-  `into_parts()`](https://github.com/Yunuuuu/rust-notes/blob/main/src/into_parts.md).
+- Follow the ownership-boundary guidance in
+  [Rust notes: `into_parts()`][into-parts].
   Provide `into_parts(self)` only when downstream code actually needs ownership
   of fields without cloning large values such as `String` or `Vec`, and no
   longer needs the original object.
@@ -120,3 +120,6 @@ mod tests;
   `refactor`, `perf`, `ci`, `build`, or `chore`.
 - Write concise English descriptions of the actual change. For example,
   `feat: add framed decoding` or `ci: test stable and MSRV`.
+
+[into-parts]:
+  https://github.com/Yunuuuu/rust-notes/blob/main/src/into_parts.md

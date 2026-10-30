@@ -51,8 +51,9 @@ fn compare<W: Write>(
     items: &[Vec<u8>],
 ) -> Vec<table::Row<5>> {
     let mut times = [Vec::new(), Vec::new()];
-    // Alternate order on every sample, including two warm-ups. Time construction,
-    // encoding, flushing and destruction. Reset the destination outside timing.
+    // Alternate order on every sample, including two warm-ups. Time
+    // construction, encoding, flushing and destruction. Reset the destination
+    // outside timing.
     for sample in 0..SAMPLES + 2 {
         for order in 0..2 {
             let mode = (sample + order) % 2;

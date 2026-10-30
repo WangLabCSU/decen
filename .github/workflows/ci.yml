@@ -14,12 +14,17 @@ concurrency:
 
 jobs:
   test:
-    name: Rust ${{ matrix.toolchain }}
+    name: Rust ${{ matrix.toolchain }} (${{ matrix.configuration }})
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        toolchain: [stable, "1.95.0"]
+        include:
+          - toolchain: stable
+            configuration: default
+            features: ""
+          - toolchain: nightly
+            configuration: all-features
+            features: --all-features
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
@@ -38,22 +43,18 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Test
-        run: cargo test --locked --all-features
+        run: cargo test --locked ${{ matrix.features }}
 
       - name: Install formatting and lint tools
-        if: matrix.toolchain == 'stable'
         run: rustup component add rustfmt clippy
 
       - name: Check formatting
-        if: matrix.toolchain == 'stable'
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        if: matrix.toolchain == 'stable'
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
 
       - name: Check documentation
-        if: matrix.toolchain == 'stable'
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --all-features --no-deps
+        run: cargo doc --locked ${{ matrix.features }} --no-deps

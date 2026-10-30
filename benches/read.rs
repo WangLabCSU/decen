@@ -1,10 +1,16 @@
 //! Compare complete LF-delimited Items using identical input and initial buffer
 //! capacities. Small, medium, and large groups use 20-byte steps up to
 //! 500 B, 1000 B, and 1500 B respectively, including LF.
-//! Run all three groups with `cargo bench --bench read`.
+//! A fourth read-only workload uses Items larger than the initial buffer.
+//! Run with `cargo bench --bench read`; add `--features nightly` on nightly
+//! Rust to use Read::read_buf.
+
+#![cfg_attr(feature = "nightly", feature(core_io_borrowed_buf, read_buf))]
 
 use std::fs::OpenOptions;
 use std::hint::black_box;
+#[cfg(feature = "nightly")]
+use std::io::BorrowedBuf;
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::mem;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -26,7 +32,7 @@ const METHODS: [&str; 13] = [
     "Frame::ready_copy(..end, end); FramedRead::decode_view()",
     "FramedRead<_, Lines<false>>::decode_owned()",
     "BufReader::fill_buf() + consume(n)",
-    "BufReader::fill_buf() + frame.to_vec() + consume(n)",
+    "BufReader::fill_buf() + finish_owned::<true>() + consume(n)",
     "BufReader::read_until(b'\\n', &mut Vec::new())",
     "&BytesMut[..end] + advance(end)",
     "BytesMut[..end].to_vec() + advance(end)",
@@ -306,16 +312,32 @@ fn bytes_mut<R: Read, const MODE: usize, const VERIFY: bool>(mut source: R) -> (
             // reclaiming the prefix removed by advance/split_to itself.
             buffer.reserve(CAPACITY / 2);
             let filled = buffer.len();
-            let capacity = buffer.capacity();
-            // Match Buffer::write_buf's temporary write-only Read contract.
-            // The benchmark's Cursor and File sources write the destination
-            // without inspecting it; deliberately expose the uninitialized tail.
-            unsafe { buffer.set_len(capacity) };
-            let nread = source.read(&mut buffer[filled..]).unwrap();
-            assert!(nread <= capacity - filled);
-            // SAFETY: the prefix was initialized before reading and Read wrote
-            // nread bytes after it. The checked count keeps the sum in capacity.
-            unsafe { buffer.set_len(filled + nread) };
+            #[cfg(feature = "nightly")]
+            let nread = {
+                // Use the same read_buf interface as FramedRead.
+                let mut dst = BorrowedBuf::from(buffer.spare_capacity_mut());
+                source.read_buf(dst.unfilled()).unwrap();
+                let nread = dst.len();
+                // SAFETY: BorrowedBuf's filled prefix contains nread
+                // initialized bytes following the existing input.
+                unsafe { buffer.set_len(filled + nread) };
+                nread
+            };
+            #[cfg(not(feature = "nightly"))]
+            let nread = {
+                // Read::read requires initialized bytes. This direct BytesMut
+                // keeps only input in len(), so resize initializes the writable
+                // tail on each refill; it has no separate initialization bound.
+                buffer.resize(buffer.capacity(), 0);
+                let dst = &mut buffer[filled..];
+                let nread = source.read(dst).unwrap();
+                assert!(
+                    nread <= dst.len(),
+                    "reader returned more bytes than requested"
+                );
+                buffer.truncate(filled + nread);
+                nread
+            };
             if nread == 0 {
                 assert!(buffer.is_empty(), "incomplete line");
                 break;
@@ -348,29 +370,34 @@ fn compare<R: Read + Seek>(
     source: &mut R,
     kind: &str,
     expected: (usize, usize),
-) -> Vec<table::Row<6>> {
+    verify_only: bool,
+) -> Vec<table::Row<7>> {
     // Verify every byte before timing; timed runs only present each frame to
     // black_box.
     for mode in 0..METHODS.len() {
         source.rewind().unwrap();
         assert_eq!(run::<_, true>(&mut *source, mode), expected);
     }
+    if verify_only {
+        return Vec::new();
+    }
     let mut times: [Vec<f64>; METHODS.len()] = Default::default();
     // Two warm-ups; rotate methods so no method always runs first.
     for sample in 0..SAMPLES + 2 {
         for order in 0..METHODS.len() {
             let mode = (sample + order) % METHODS.len();
-            let start = Instant::now();
-            let mut count = 0;
+            let mut elapsed = 0.0;
             for _ in 0..ROUNDS {
                 source.rewind().unwrap();
+                let start = Instant::now();
                 // Include reader construction, reading, decoding and
                 // destruction.
                 // Each owned result is dropped before decoding the next Item.
-                count += run::<_, false>(&mut *source, mode).0;
+                let totals = run::<_, false>(&mut *source, mode);
+                elapsed += start.elapsed().as_secs_f64();
+                assert_eq!(totals, expected);
             }
-            let elapsed = start.elapsed().as_secs_f64() * 1e9 / (expected.0 * ROUNDS) as f64;
-            assert_eq!(count, expected.0 * ROUNDS);
+            let elapsed = elapsed * 1e9 / (expected.0 * ROUNDS) as f64;
             if sample >= 2 {
                 times[mode].push(elapsed);
             }
@@ -409,6 +436,12 @@ fn compare<R: Read + Seek>(
                 format!("{:.2}", values[SAMPLES / 2]),
                 format!("{:.2}", values[0]),
                 format!("{:.2}", values[SAMPLES - 1]),
+                format!(
+                    "{:.2}",
+                    expected.1 as f64 / expected.0 as f64 * 1e9
+                        / values[SAMPLES / 2]
+                        / (1024.0 * 1024.0)
+                ),
             ],
         });
     }
@@ -416,6 +449,15 @@ fn compare<R: Read + Seek>(
 }
 
 fn main() -> io::Result<()> {
+    println!(
+        "Read API for FramedRead and direct BytesMut: {}",
+        if cfg!(feature = "nightly") {
+            "Read::read_buf (nightly feature enabled)"
+        } else {
+            "Read::read (initialized destinations)"
+        }
+    );
+    let verify_only = std::env::args().skip(1).any(|arg| arg == "--test");
     // Exercise repeated accumulation and truncation separately from timing;
     // normal workloads also verify every complete Item before each benchmark.
     let mut check = FramedRead::with_capacity(
@@ -444,15 +486,26 @@ fn main() -> io::Result<()> {
         .write(true)
         .create_new(true)
         .open(&path)?;
-    let workloads: [(&str, Vec<usize>); 3] = [
+    let workloads: [(&str, Vec<usize>); 4] = [
         ("small-variable", (20..=500).step_by(20).collect()),
         ("medium-variable", (520..=1000).step_by(20).collect()),
         ("large-variable", (1020..=1500).step_by(20).collect()),
+        // Avoid exact multiples of the read buffer so boundaries move across
+        // reads. These Items exercise repeated refills and buffer growth.
+        (
+            "oversized-variable",
+            vec![
+                (16 << 10) + 3,
+                (64 << 10) + 5,
+                (100 << 10) + 7,
+                (256 << 10) + 11,
+                (1 << 20) + 13,
+            ],
+        ),
     ];
     for (label, sizes) in workloads {
         // All lengths include LF. Payload bytes exclude LF and vary by
-        // position,
-        // so verification catches truncated, reordered or duplicated data.
+        // position so verification can detect incorrect frame contents.
         let mut data = Vec::new();
         let mut frames = 0;
         while data.len() < 4 * 1024 * 1024 || frames < 64 {
@@ -463,18 +516,36 @@ fn main() -> io::Result<()> {
             frames += 1;
         }
         let expected = (frames, data.len());
-        let mut rows = compare(&mut io::Cursor::new(&data), "memory", expected);
+        let mut rows = compare(&mut io::Cursor::new(&data), "memory", expected, verify_only);
         file.rewind()?;
         file.set_len(0)?;
         file.write_all(&data)?;
         // Recently written files measure cached I/O, not storage-device
         // latency.
-        rows.extend(compare(&mut file, "file-cached", expected));
-        // Keep each highlighted comparison together without changing timing order.
+        rows.extend(compare(&mut file, "file-cached", expected, verify_only));
+        if verify_only {
+            println!(
+                "{label}: verified {} methods on memory and file-cached \
+                 sources ({frames} Items, {} bytes each pass)",
+                METHODS.len(),
+                data.len(),
+            );
+            continue;
+        }
+        // Keep each highlighted comparison together without changing timing
+        // order.
         rows.sort_by_key(|row| (row.cells[0] != "memory", row.cells[1] != "borrowed"));
         table::print(
             label,
-            ["source", "Item", "call", "median ns/Item", "min", "max"],
+            [
+                "source",
+                "Item",
+                "call",
+                "median ns/Item",
+                "min",
+                "max",
+                "median MiB/s",
+            ],
             &rows,
             3,
             2,
@@ -486,6 +557,15 @@ fn main() -> io::Result<()> {
             mean / 1024.0,
         );
         println!("Initial buffer capacity: {CAPACITY} B.");
+        println!(
+            "Each sample reads the full dataset {ROUNDS} times. \
+             {SAMPLES} recorded samples follow two warm-ups; method order rotates. \
+             Rewinding and content verification are outside timing."
+        );
+        println!(
+            "BufReader keeps its fixed capacity; the other buffers can grow. \
+             Read request sizes can differ, and no artificial short-read limit is applied."
+        );
         println!(
             "Framing: decode_view compares ready_split(..end, 0) with \
              ready_copy(..end, end); both return borrowed slices without \

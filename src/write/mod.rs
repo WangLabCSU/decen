@@ -33,7 +33,11 @@ use crate::DEFAULT_BUF_SIZE;
 /// impl Encoder<[u8; 2]> for Pairs {
 ///     type Error = io::Error;
 ///
-///     fn encode<W: Write + ?Sized>(&mut self, item: [u8; 2], writer: &mut W) -> io::Result<()> {
+///     fn encode<W: Write + ?Sized>(
+///         &mut self,
+///         item: [u8; 2],
+///         writer: &mut W,
+///     ) -> io::Result<()> {
 ///         writer.write_all(&item)
 ///     }
 /// }

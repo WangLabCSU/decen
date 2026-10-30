@@ -9,8 +9,18 @@
 for defining frame boundaries, decoding frames, and encoding values, together
 with buffered readers and writers that use those implementations.
 
+The default configuration supports stable Rust. The `nightly` feature switches
+`FramedRead` to `Read::read_buf` and requires nightly Rust. This uses the
+standard-library features `read_buf`, `core_io_borrowed_buf`, and
+`borrowed_buf_init` to read into uninitialized space and track its
+initialization state. This can avoid initializing the read destination for
+sources that support this API.
+
+To enable the nightly read path, use
+`cargo +nightly build --features nightly`.
+
 The design is inspired by
-[`tokio-util::codec`](https://docs.rs/tokio-util/latest/tokio_util/codec/index.html),
+[`tokio-util::codec`][codec],
 which adapts asynchronous I/O into `Stream` and `Sink` transports. decen focuses
 on efficient frame processing through `std::io::Read` and `std::io::Write`,
 emphasizing memory reuse and control over the ownership of decoded data.
@@ -77,12 +87,16 @@ Implement `Encoder<Item>` to write an Item's encoded bytes.
 
 `Framer::frame` returns a `Frame` describing the next action.
 
-| Constructor                    | Selection and consumption                                                                                                                           |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ready_split(range, addition)` | Selects `range` and consumes through its end plus `addition` bytes; `decode_bytes()` transfers the selection without copying                        |
-| `ready_copy(range, consume)`   | Selects `range` independently of consuming the first `consume` bytes, allowing adjacent frames to overlap; `decode_bytes()` copies the framed bytes |
-| `skip(amount)`                 | Skips the first `amount` bytes of the current input without producing an Item                                                                       |
-| `need_more(consume)`           | Consumes the first `consume` bytes of the current input before requesting more data                                                                 |
+- `ready_split(range, addition)`: Selects `range` and consumes through its end
+  plus `addition` bytes; `decode_bytes()` transfers the selection without
+  copying.
+- `ready_copy(range, consume)`: Selects `range` independently of consuming the
+  first `consume` bytes, allowing adjacent frames to overlap; `decode_bytes()`
+  copies the framed bytes.
+- `skip(amount)`: Skips the first `amount` bytes of the current input without
+  producing an Item.
+- `need_more(consume)`: Consumes the first `consume` bytes of the current input
+  before requesting more data.
 
 Both ready actions can be used with any of the three decoder traits. All
 selections and consumption counts are relative to the input passed to `frame`
@@ -135,7 +149,10 @@ impl BytesDecoder for ByteCodec {
 impl ViewDecoder for ByteCodec {
     type Item<'a> = &'a [u8];
 
-    fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<Self::Item<'a>> {
+    fn decode_view<'a>(
+        &mut self,
+        frame: &'a [u8],
+    ) -> io::Result<Self::Item<'a>> {
         Ok(frame)
     }
 }
@@ -151,10 +168,17 @@ impl OwnedDecoder for ByteCodec {
 impl<T: AsRef<[u8]>> Encoder<T> for ByteCodec {
     type Error = io::Error;
 
-    fn encode<W: io::Write + ?Sized>(&mut self, item: T, writer: &mut W) -> io::Result<()> {
+    fn encode<W: io::Write + ?Sized>(
+        &mut self,
+        item: T,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let bytes = item.as_ref();
         if bytes.len() != 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected one byte"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected one byte",
+            ));
         }
         writer.write_all(bytes)?;
         Ok(())
@@ -184,3 +208,5 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 ```
+
+[codec]: https://docs.rs/tokio-util/latest/tokio_util/codec/index.html

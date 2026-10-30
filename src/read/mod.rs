@@ -1,4 +1,6 @@
 //! Framing and decoding byte streams with [`FramedRead`].
+//!
+//! The `nightly` feature uses `Read::read_buf` and requires nightly Rust.
 
 use std::io::Read;
 
@@ -56,21 +58,6 @@ use crate::DEFAULT_BUF_SIZE;
 /// not a memory limit: large Items can grow the buffer, and retained owned
 /// Items can keep shared allocations alive after the reader is dropped.
 ///
-/// Consumption and changes to format state are not rolled back on errors.
-/// A decoding error occurs after the framing decision's consumption has been
-/// applied. Whether decoding can continue depends on the format.
-///
-/// # Read contract
-///
-/// The input source and every `Read` adapter wrapping it must treat the
-/// destination as write-only: they must not read its existing contents,
-/// including on calls that return an error or panic. A successful read must
-/// write every byte included in its returned count. Bytes from a failed read
-/// are not included in the buffered input.
-///
-/// This contract is temporary. It will be removed after migrating to stable
-/// standard-library support for reading into uninitialized buffers.
-///
 /// # Examples
 ///
 /// Reading one borrowed pair of bytes at a time:
@@ -97,7 +84,10 @@ use crate::DEFAULT_BUF_SIZE;
 /// impl ViewDecoder for Pairs {
 ///     type Item<'a> = &'a [u8];
 ///
-///     fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<Self::Item<'a>> {
+///     fn decode_view<'a>(
+///         &mut self,
+///         frame: &'a [u8],
+///     ) -> io::Result<Self::Item<'a>> {
 ///         Ok(frame)
 ///     }
 /// }
@@ -164,7 +154,8 @@ impl<R: ?Sized + Read, D> FramedRead<R, D> {
 impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     /// Decodes the next Item from framed bytes in an owned [`BytesMut`].
     ///
-    /// Returns `None` when the input has ended and no further Item is available.
+    /// Returns `None` when the input has ended and no further Item is
+    /// available.
     ///
     /// # Errors
     ///
@@ -199,7 +190,8 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
 
     /// Decodes the next Item from a slice of framed bytes.
     ///
-    /// Returns `None` when the input has ended and no further Item is available.
+    /// Returns `None` when the input has ended and no further Item is
+    /// available.
     ///
     /// # Errors
     ///
@@ -224,7 +216,8 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
 
     /// Decodes the next Item without borrowing framed bytes in the result.
     ///
-    /// Returns `None` when the input has ended and no further Item is available.
+    /// Returns `None` when the input has ended and no further Item is
+    /// available.
     ///
     /// # Errors
     ///
@@ -314,7 +307,8 @@ mod test {
     use super::{BytesDecoder, Frame, FramedRead, Framer, OwnedDecoder, ViewDecoder};
     use crate::test::allocations;
 
-    // Minimal framing fixture for I/O tests, not a public format implementation.
+    // Minimal framing fixture for I/O tests, not a public format
+    // implementation.
     // Retain each LF in the selected bytes; accept a final nonempty EOF tail.
     #[derive(Default)]
     struct Lines {
@@ -511,19 +505,16 @@ mod test {
                                 Lines::default(),
                                 capacity,
                             );
-                            let error = match mode {
-                                0 => reader.decode_bytes().unwrap_err(),
-                                1 => reader.decode_view().unwrap_err(),
-                                _ => reader.decode_owned().unwrap_err(),
-                            };
-                            assert_eq!(
-                                error.kind(),
-                                if overreport {
-                                    ErrorKind::InvalidData
-                                } else {
-                                    ErrorKind::Other
-                                }
-                            );
+                            let result = catch_unwind(AssertUnwindSafe(|| match mode {
+                                0 => reader.decode_bytes().map(|_| ()),
+                                1 => reader.decode_view().map(|_| ()),
+                                _ => reader.decode_owned().map(|_| ()),
+                            }));
+                            if overreport {
+                                assert!(result.is_err());
+                            } else {
+                                assert_eq!(result.unwrap().unwrap_err().kind(), ErrorKind::Other);
+                            }
                             assert_eq!(reader.buffer.buffer(), prefix);
                             let expected = [prefix, b"ok\n"].concat();
                             match retry_mode {
@@ -605,7 +596,8 @@ mod test {
         let mut source = Cursor::new(b"a=1\nb=2\n");
         let mut reader = FramedRead::new(&mut source, Lines::default());
         assert_eq!(reader.decode_view().unwrap().unwrap(), b"a=1\n");
-        // Dropping the reader discards buffered input without rewinding the source.
+        // Dropping the reader discards buffered input without rewinding the
+        // source.
         drop(reader);
         assert_eq!(source.position(), 8);
         let mut remaining = Vec::new();
@@ -1211,14 +1203,13 @@ mod test {
                     1 => reader.decode_view().map(|_| ()),
                     _ => reader.decode_owned().map(|_| ()),
                 }));
-                if failure < 4 {
+                if failure < 3 {
                     assert_eq!(
                         result.unwrap().unwrap_err().kind(),
                         [
                             ErrorKind::Interrupted,
                             ErrorKind::WouldBlock,
                             ErrorKind::Other,
-                            ErrorKind::InvalidData
                         ][failure]
                     );
                 } else {
@@ -2074,8 +2065,9 @@ mod test {
 
     #[test]
     fn bounded_items_reuse_consumed_space_instead_of_growing_with_the_stream() {
-        // Three-byte Items straddle an eight-byte buffer. A pending tail prevents
-        // the empty-buffer reset from masking a failure to reclaim the prefix.
+        // Three-byte Items straddle an eight-byte buffer. A pending tail
+        // prevents the empty-buffer reset from masking a failure to reclaim
+        // the prefix.
         for (view, copy) in [(true, false), (false, true), (false, false)] {
             let mut reader = FramedRead::with_capacity(Repeating::default(), Triples { copy }, 8);
             for _ in 0..100_000 {

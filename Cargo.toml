@@ -3,7 +3,6 @@ name = "decen"
 version = "0.1.0"
 authors = ["Yun Peng <pengyun.me@outlook.com>"]
 edition = "2024"
-rust-version = "1.95"
 description = "A decoder and encoder (decen) framework for byte streams"
 license = "MIT"
 readme = "README.md"
@@ -11,6 +10,9 @@ repository = "https://github.com/WangLabCSU/decen"
 keywords = ["codec", "framing", "io", "buffer", "zero-copy"]
 categories = ["encoding"]
 exclude = ["/AGENTS.md", "/.github/", "/.gitignore", "/rust-toolchain.toml"]
+
+[features]
+nightly = []
 
 [dependencies]
 bytes = "1.12.*"
