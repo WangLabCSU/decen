@@ -198,6 +198,30 @@ impl Frame {
 ///
 /// Framing and decoding can be stateful. Implementations may keep parsing
 /// state in `self` across calls.
+///
+/// [`FramedRead`](super::FramedRead) uses this call sequence on the same
+/// format instance:
+///
+/// - Call [`frame`](Self::frame) with the buffered input, which may be empty.
+/// - For a valid ready decision, consume the requested prefix and call exactly
+///   one decoder method with the selected bytes before framing again. The
+///   selection's contents and the format's parsing state are unchanged
+///   between framing and decoding. The decoding method may differ per Item.
+/// - For [`Frame::need_more`], consume the requested prefix and attempt a
+///   read before framing again. Retained bytes stay unchanged; new bytes are
+///   appended at the end. A failed read does not undo consumption.
+/// - For [`Frame::skip`], consume the requested prefix and frame again
+///   without decoding or reading.
+///
+/// After a read returns zero, framing uses [`frame_eof`](Self::frame_eof)
+/// until more input arrives. A framing error or rejected decision consumes
+/// nothing for that call; a decoding error leaves consumption applied. The
+/// same applies if either operation panics. Implementations must remain safe
+/// to retry with the corresponding remaining input.
+///
+/// These rules allow framing to reuse scan offsets and decoding to reuse
+/// information recorded while framing. Direct callers must maintain the same input
+/// continuity and call sequence and satisfy each method's safety requirements.
 pub trait Framer {
     /// The error type shared by framing, decoding, and input I/O.
     ///
@@ -234,7 +258,12 @@ pub trait Framer {
     /// consumption and changes to format state are not rolled back.
     /// Implementations should document whether framing can continue after an
     /// error.
-    fn frame(&mut self, src: &[u8]) -> Result<Frame, Self::Error>;
+    ///
+    /// # Safety
+    ///
+    /// Between calls to `frame`, the unconsumed contents of `src` must remain
+    /// unchanged, with new bytes appended only at the end.
+    unsafe fn frame(&mut self, src: &[u8]) -> Result<Frame, Self::Error>;
 
     /// Examines remaining input when the source has reached EOF.
     ///
@@ -264,8 +293,15 @@ pub trait Framer {
     /// The default implementation returns errors from [`frame`](Self::frame)
     /// and reports incomplete trailing input as
     /// [`io::ErrorKind::UnexpectedEof`].
-    fn frame_eof(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
-        let frame = self.frame(src)?;
+    ///
+    /// # Safety
+    ///
+    /// The input and decoder state must satisfy [`frame`](Self::frame)'s
+    /// safety requirements. This method may be called repeatedly at EOF;
+    /// framing may resume through `frame` if further input arrives.
+    unsafe fn frame_eof(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
+        // SAFETY: frame_eof forwards the same input and framing state.
+        let frame = unsafe { self.frame(src)? };
         match frame.0 {
             // Consuming a prefix does not complete the remaining input.
             FrameInner::NeedMore(consume) if consume < src.len() => {
@@ -301,7 +337,14 @@ pub trait BytesDecoder: Framer {
     ///
     /// Return an error if `frame` cannot be decoded. The reader has already
     /// applied the framing decision's consumption and does not undo it.
-    fn decode_bytes(&mut self, frame: BytesMut) -> Result<Self::Item, Self::Error>;
+    ///
+    /// # Safety
+    ///
+    /// The most recent framing call on this decoder must have returned a
+    /// ready decision that has not yet been decoded. `frame` must contain
+    /// exactly its selected bytes, in order and unchanged, and the decoder's
+    /// parsing state must not have been changed since that call.
+    unsafe fn decode_bytes(&mut self, frame: BytesMut) -> Result<Self::Item, Self::Error>;
 }
 
 /// Decodes framed bytes into Items that may borrow the input.
@@ -332,7 +375,14 @@ pub trait ViewDecoder: Framer {
     ///
     /// Return an error if `frame` cannot be decoded. The reader has already
     /// applied the framing decision's consumption and does not undo it.
-    fn decode_view<'a>(&mut self, frame: &'a [u8]) -> Result<Self::Item<'a>, Self::Error>;
+    ///
+    /// # Safety
+    ///
+    /// The most recent framing call on this decoder must have returned a
+    /// ready decision that has not yet been decoded. `frame` must contain
+    /// exactly its selected bytes, in order and unchanged, and the decoder's
+    /// parsing state must not have been changed since that call.
+    unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> Result<Self::Item<'a>, Self::Error>;
 }
 
 /// Decodes framed bytes into Items that do not borrow the input.
@@ -346,12 +396,6 @@ pub trait ViewDecoder: Framer {
 /// Implement independently or alongside [`BytesDecoder`] and [`ViewDecoder`].
 /// This is useful with [`Frame::ready_copy`], since it avoids copying the
 /// entire frame into a [`BytesMut`] before decoding.
-///
-/// An existing [`ViewDecoder`] implementation can be reused when its Item
-/// provides a conversion such as `into_owned()` to a result that no longer
-/// borrows the input. For example, [`decode_owned`](Self::decode_owned) can
-/// return `Ok(self.decode_view(frame)?.into_owned())`. That conversion may
-/// allocate and copy borrowed fields; its cost is part of decoding.
 pub trait OwnedDecoder: Framer {
     /// The decoded result, independent of the input slice's lifetime.
     type Item;
@@ -367,7 +411,14 @@ pub trait OwnedDecoder: Framer {
     ///
     /// Return an error if `frame` cannot be decoded. The reader has already
     /// applied the framing decision's consumption and does not undo it.
-    fn decode_owned(&mut self, frame: &[u8]) -> Result<Self::Item, Self::Error>;
+    ///
+    /// # Safety
+    ///
+    /// The most recent framing call on this decoder must have returned a
+    /// ready decision that has not yet been decoded. `frame` must contain
+    /// exactly its selected bytes, in order and unchanged, and the decoder's
+    /// parsing state must not have been changed since that call.
+    unsafe fn decode_owned(&mut self, frame: &[u8]) -> Result<Self::Item, Self::Error>;
 }
 
 #[cfg(test)]
@@ -382,7 +433,7 @@ mod test {
         impl Framer for Pairs {
             type Error = io::Error;
 
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
                 Ok(if src.len() < 2 {
                     Frame::need_more(0)
                 } else {
@@ -392,10 +443,14 @@ mod test {
         }
 
         let mut codec = Pairs;
-        assert_eq!(codec.frame(b"").unwrap(), Frame::need_more(0));
-        assert_eq!(codec.frame_eof(b"").unwrap(), Frame::need_more(0));
-        assert!(codec.frame_eof(b"a").is_err());
-        assert_eq!(codec.frame_eof(b"ab").unwrap(), Frame::ready_split(..2, 0));
+        // SAFETY: start with empty input, then retain it and append bytes.
+        // No call consumes input or produces a ready frame until the last.
+        unsafe {
+            assert_eq!(codec.frame(b"").unwrap(), Frame::need_more(0));
+            assert_eq!(codec.frame_eof(b"").unwrap(), Frame::need_more(0));
+            assert!(codec.frame_eof(b"a").is_err());
+            assert_eq!(codec.frame_eof(b"ab").unwrap(), Frame::ready_split(..2, 0));
+        }
     }
 
     #[test]
@@ -404,8 +459,21 @@ mod test {
         impl Framer for Decision {
             type Error = io::Error;
 
-            fn frame(&mut self, _: &[u8]) -> io::Result<Frame> {
+            unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+                if src.is_empty() {
+                    return Ok(Frame::need_more(0));
+                }
                 std::mem::replace(&mut self.0, Ok(Frame::need_more(0)))
+            }
+        }
+
+        fn at_eof(decision: io::Result<Frame>) -> io::Result<Frame> {
+            let mut codec = Decision(decision);
+            // SAFETY: start with empty input, then supply the appended bytes.
+            // The empty call neither consumes input nor produces an Item.
+            unsafe {
+                codec.frame(b"")?;
+                codec.frame_eof(b"ab")
             }
         }
 
@@ -415,20 +483,17 @@ mod test {
             Frame::ready_split(..0, 0),
             Frame::ready_copy(..2, 1),
         ] {
-            assert_eq!(Decision(Ok(frame.clone())).frame_eof(b"ab").unwrap(), frame);
+            assert_eq!(at_eof(Ok(frame.clone())).unwrap(), frame);
         }
         for consume in [0, 1] {
             assert_eq!(
-                Decision(Ok(Frame::need_more(consume)))
-                    .frame_eof(b"ab")
-                    .unwrap_err()
-                    .kind(),
+                at_eof(Ok(Frame::need_more(consume))).unwrap_err().kind(),
                 io::ErrorKind::UnexpectedEof
             );
         }
         let error = io::Error::new(io::ErrorKind::InvalidData, "invalid header");
         assert_eq!(
-            Decision(Err(error)).frame_eof(b"ab").unwrap_err().kind(),
+            at_eof(Err(error)).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }

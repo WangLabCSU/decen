@@ -72,7 +72,7 @@ use crate::DEFAULT_BUF_SIZE;
 /// impl Framer for Pairs {
 ///     type Error = io::Error;
 ///
-///     fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+///     unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
 ///         Ok(if src.len() < 2 {
 ///             Frame::need_more(0)
 ///         } else {
@@ -84,7 +84,7 @@ use crate::DEFAULT_BUF_SIZE;
 /// impl ViewDecoder for Pairs {
 ///     type Item<'a> = &'a [u8];
 ///
-///     fn decode_view<'a>(
+///     unsafe fn decode_view<'a>(
 ///         &mut self,
 ///         frame: &'a [u8],
 ///     ) -> io::Result<Self::Item<'a>> {
@@ -179,12 +179,16 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
                 let view = self.buffer.take_view(range.bounds(), consume);
                 let mut bytes = BytesMut::with_capacity(view.len());
                 bytes.extend_from_slice(view);
-                self.decoder.decode_bytes(bytes).map(Some)
+                // SAFETY: frame_ready just selected these bytes with this
+                // decoder. Copying preserves the selection and decoder state.
+                unsafe { self.decoder.decode_bytes(bytes).map(Some) }
             }
-            FrameReady::Split { range, addition } => self
-                .decoder
-                .decode_bytes(self.buffer.take_bytes(range.bounds(), addition))
-                .map(Some),
+            FrameReady::Split { range, addition } => {
+                let bytes = self.buffer.take_bytes(range.bounds(), addition);
+                // SAFETY: extraction selects exactly the bytes from the most
+                // recent ready decision, without changing decoder state.
+                unsafe { self.decoder.decode_bytes(bytes).map(Some) }
+            }
         }
     }
 
@@ -211,7 +215,9 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
             return Ok(None);
         };
         let slice = Self::take_frame_view(&mut self.buffer, ready);
-        Ok(Some(self.decoder.decode_view(slice)?))
+        // SAFETY: the slice is the selection from the immediately preceding
+        // framing call. No decoder call or state change has intervened.
+        Ok(Some(unsafe { self.decoder.decode_view(slice)? }))
     }
 
     /// Decodes the next Item without borrowing framed bytes in the result.
@@ -237,7 +243,9 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
             return Ok(None);
         };
         let view = Self::take_frame_view(&mut self.buffer, ready);
-        Ok(Some(self.decoder.decode_owned(view)?))
+        // SAFETY: the slice is the selection from the immediately preceding
+        // framing call. No decoder call or state change has intervened.
+        Ok(Some(unsafe { self.decoder.decode_owned(view)? }))
     }
 
     // Keep the view's borrow confined to the buffer so the decoder can be
@@ -259,9 +267,15 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
             let buf = self.buffer.buffer();
             let frame = if self.eof {
                 std::hint::cold_path();
-                self.decoder.frame_eof(buf)?
+                // SAFETY: the first call has empty input. Thereafter this
+                // loop applies each consumption once and preserves the
+                // remaining bytes across refills and retries. Ready frames
+                // are decoded before this loop is entered again.
+                unsafe { self.decoder.frame_eof(buf)? }
             } else {
-                self.decoder.frame(buf)?
+                // SAFETY: the same call sequence and input preservation as
+                // in the EOF branch apply when the source supplies data.
+                unsafe { self.decoder.frame(buf)? }
             };
             match frame.0 {
                 FrameInner::Ready(ready) => return Ok(Some(ready)),
@@ -316,7 +330,7 @@ mod test {
     }
     impl Framer for Lines {
         type Error = io::Error;
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             if let Some(offset) = src[self.scanned..].iter().position(|&b| b == b'\n') {
                 let end = self.scanned + offset + 1;
                 self.scanned = 0;
@@ -326,8 +340,9 @@ mod test {
                 Ok(Frame::need_more(0))
             }
         }
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
-            let frame = self.frame(src)?;
+        unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+            // SAFETY: frame_eof forwards the same input and framing state.
+            let frame = unsafe { self.frame(src)? };
             if frame != Frame::need_more(0) {
                 return Ok(frame);
             }
@@ -341,20 +356,20 @@ mod test {
     }
     impl BytesDecoder for Lines {
         type Item = Bytes;
-        fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Bytes> {
+        unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Bytes> {
             Ok(frame.freeze())
         }
     }
     impl ViewDecoder for Lines {
         type Item<'a> = &'a [u8];
-        fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
+        unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
             Ok(frame)
         }
     }
 
     impl OwnedDecoder for Lines {
         type Item = Vec<u8>;
-        fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
+        unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
             Ok(frame.to_vec())
         }
     }
@@ -612,19 +627,21 @@ mod test {
         impl Framer for OwnedView {
             type Error = io::Error;
 
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
-                self.0.frame(src)
+            unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+                // SAFETY: this wrapper forwards every framing call to its inner codec.
+                unsafe { self.0.frame(src) }
             }
 
-            fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
-                self.0.frame_eof(src)
+            unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+                // SAFETY: this wrapper forwards every framing call to its inner codec.
+                unsafe { self.0.frame_eof(src) }
             }
         }
 
         impl ViewDecoder for OwnedView {
             type Item<'a> = Vec<u8>;
 
-            fn decode_view(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
+            unsafe fn decode_view(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
                 Ok(frame.to_vec())
             }
         }
@@ -690,6 +707,124 @@ mod test {
     }
 
     #[test]
+    fn unsafe_methods_reuse_offsets_across_refills_retries_and_decode_modes() {
+        #[derive(Default)]
+        struct CachedLines {
+            scanned: usize,
+            frame_len: usize,
+        }
+
+        impl Framer for CachedLines {
+            type Error = io::Error;
+
+            unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+                // Empty input is also the entry point for a new reader using
+                // an old decoder; previous offsets cannot be trusted here.
+                if src.is_empty() {
+                    self.scanned = 0;
+                    self.frame_len = 0;
+                    return Ok(Frame::need_more(0));
+                }
+                assert_eq!(self.frame_len, 0, "a ready frame was not decoded");
+                // SAFETY: after NeedMore(0), the caller retains all previously
+                // scanned bytes, even after failed reads or across EOF.
+                // After a ready decision this implementation resets scanned.
+                let tail = unsafe { src.get_unchecked(self.scanned..) };
+                if let Some(end) = tail.iter().position(|&b| b == b'\n') {
+                    self.frame_len = self.scanned + end + 1;
+                    self.scanned = 0;
+                    Ok(Frame::ready_split(..self.frame_len, 0))
+                } else {
+                    self.scanned = src.len();
+                    Ok(Frame::need_more(0))
+                }
+            }
+
+            unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+                // SAFETY: forwarding preserves both input and framing state.
+                // Keep incomplete input so a source can resume after EOF.
+                unsafe { self.frame(src) }
+            }
+        }
+
+        impl ViewDecoder for CachedLines {
+            type Item<'a> = &'a [u8];
+
+            unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
+                let len = std::mem::take(&mut self.frame_len);
+                assert_ne!(len, 0, "no ready frame to decode");
+                // SAFETY: the preceding framing call selected exactly len
+                // bytes, and the decoder contract supplies that selection.
+                Ok(unsafe { frame.get_unchecked(..len) })
+            }
+        }
+
+        impl BytesDecoder for CachedLines {
+            type Item = Bytes;
+
+            unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Bytes> {
+                // SAFETY: the same selection and untouched parsing state are
+                // forwarded; borrowing frame does not alter its contents.
+                unsafe { self.decode_view(&frame)? };
+                Ok(frame.freeze())
+            }
+        }
+
+        impl OwnedDecoder for CachedLines {
+            type Item = Vec<u8>;
+
+            unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
+                // SAFETY: delegation passes the same selection and state.
+                Ok(unsafe { self.decode_view(frame)? }.to_vec())
+            }
+        }
+
+        fn next(
+            reader: &mut FramedRead<Script, CachedLines>,
+            mode: usize,
+        ) -> io::Result<Option<Vec<u8>>> {
+            match mode % 3 {
+                0 => reader.decode_view().map(|item| item.map(<[u8]>::to_vec)),
+                1 => reader
+                    .decode_bytes()
+                    .map(|item| item.map(|bytes| bytes.to_vec())),
+                _ => reader.decode_owned(),
+            }
+        }
+
+        for capacity in [1, 4, 32] {
+            for first_mode in 0..3 {
+                let source = Script::new([
+                    Step::Data(b"a"),
+                    Step::Error(ErrorKind::Interrupted),
+                    Step::Data(b"b\nc"),
+                    Step::Eof,
+                    Step::Eof,
+                    Step::Data(b"d\ne\n"),
+                ]);
+                let mut codec = CachedLines::default();
+                // SAFETY: begin with empty input and append an incomplete
+                // frame without changing any retained bytes.
+                unsafe {
+                    codec.frame(b"").unwrap();
+                    codec.frame(b"previous input").unwrap();
+                }
+                // The first empty call must handle the old scanned offset.
+                let mut reader = FramedRead::with_capacity(source, codec, capacity);
+                assert_eq!(
+                    next(&mut reader, first_mode).unwrap_err().kind(),
+                    ErrorKind::Interrupted
+                );
+                assert_eq!(next(&mut reader, first_mode).unwrap().unwrap(), b"ab\n");
+                assert!(next(&mut reader, first_mode + 1).unwrap().is_none());
+                assert_eq!(next(&mut reader, first_mode + 1).unwrap().unwrap(), b"cd\n");
+                assert_eq!(next(&mut reader, first_mode + 2).unwrap().unwrap(), b"e\n");
+                assert!(next(&mut reader, first_mode).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn eof_checks_internal_state_and_can_yield_multiple_zero_byte_items() {
         struct Closing {
             remaining: u8,
@@ -697,10 +832,10 @@ mod test {
         }
         impl Framer for Closing {
             type Error = io::Error;
-            fn frame(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
+            unsafe fn frame(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
                 Ok(Frame::need_more(0))
             }
-            fn frame_eof(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
+            unsafe fn frame_eof(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
                 self.eof_calls += 1;
                 Ok(if self.remaining > 0 {
                     Frame::ready_split(..0, 0)
@@ -711,7 +846,10 @@ mod test {
         }
         impl ViewDecoder for Closing {
             type Item<'a> = u8;
-            fn decode_view<'a>(&mut self, _: &'a [u8]) -> Result<Self::Item<'a>, Self::Error> {
+            unsafe fn decode_view<'a>(
+                &mut self,
+                _: &'a [u8],
+            ) -> Result<Self::Item<'a>, Self::Error> {
                 self.remaining -= 1;
                 Ok(self.remaining)
             }
@@ -731,16 +869,19 @@ mod test {
         struct Pending;
         impl Framer for Pending {
             type Error = io::Error;
-            fn frame(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
+            unsafe fn frame(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
                 Ok(Frame::need_more(0))
             }
-            fn frame_eof(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
+            unsafe fn frame_eof(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
                 Err(io::Error::new(ErrorKind::UnexpectedEof, "unfinished state"))
             }
         }
         impl ViewDecoder for Pending {
             type Item<'a> = ();
-            fn decode_view<'a>(&mut self, _: &'a [u8]) -> Result<Self::Item<'a>, Self::Error> {
+            unsafe fn decode_view<'a>(
+                &mut self,
+                _: &'a [u8],
+            ) -> Result<Self::Item<'a>, Self::Error> {
                 unreachable!()
             }
         }
@@ -767,7 +908,7 @@ mod test {
     }
     impl Framer for Quoted {
         type Error = io::Error;
-        fn frame(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
+        unsafe fn frame(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
             for (i, &b) in src.iter().enumerate().skip(self.scanned) {
                 if self.escaped {
                     self.escaped = false;
@@ -783,8 +924,9 @@ mod test {
             self.scanned = src.len();
             Ok(Frame::need_more(0))
         }
-        fn frame_eof(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
-            let frame = self.frame(src)?;
+        unsafe fn frame_eof(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
+            // SAFETY: frame_eof forwards the same input and framing state.
+            let frame = unsafe { self.frame(src)? };
             if frame != Frame::need_more(0) {
                 return Ok(frame);
             }
@@ -803,13 +945,13 @@ mod test {
     }
     impl BytesDecoder for Quoted {
         type Item = QuotedItem<Bytes>;
-        fn decode_bytes(&mut self, src: BytesMut) -> Result<Self::Item, Self::Error> {
+        unsafe fn decode_bytes(&mut self, src: BytesMut) -> Result<Self::Item, Self::Error> {
             self.parse(src.freeze())
         }
     }
     impl ViewDecoder for Quoted {
         type Item<'a> = QuotedItem<&'a [u8]>;
-        fn decode_view<'a>(&mut self, src: &'a [u8]) -> Result<Self::Item<'a>, Self::Error> {
+        unsafe fn decode_view<'a>(&mut self, src: &'a [u8]) -> Result<Self::Item<'a>, Self::Error> {
             self.parse(src)
         }
     }
@@ -908,11 +1050,11 @@ mod test {
     }
     impl Framer for FrameScript {
         type Error = io::Error;
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             self.inputs.push((false, src.to_vec()));
             self.frames.pop_front().unwrap_or(Ok(Frame::need_more(0)))
         }
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             self.inputs.push((true, src.to_vec()));
             self.eof_frames
                 .pop_front()
@@ -921,14 +1063,14 @@ mod test {
     }
     impl BytesDecoder for FrameScript {
         type Item = Bytes;
-        fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Bytes> {
+        unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Bytes> {
             self.inspect(&frame)?;
             Ok(frame.freeze())
         }
     }
     impl ViewDecoder for FrameScript {
         type Item<'a> = &'a [u8];
-        fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
+        unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
             self.inspect(frame)?;
             Ok(frame)
         }
@@ -937,7 +1079,7 @@ mod test {
     impl OwnedDecoder for FrameScript {
         type Item = Vec<u8>;
 
-        fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
+        unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
             self.inspect(frame)?;
             Ok(frame.to_vec())
         }
@@ -1005,7 +1147,7 @@ mod test {
         impl Framer for Pairs {
             type Error = io::Error;
 
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
                 Ok(if src.len() < 2 {
                     Frame::need_more(0)
                 } else {
@@ -1016,14 +1158,14 @@ mod test {
         impl BytesDecoder for Pairs {
             type Item = BytesMut;
 
-            fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
+            unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
                 Ok(frame)
             }
         }
         impl ViewDecoder for Pairs {
             type Item<'a> = &'a [u8];
 
-            fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
+            unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
                 Ok(frame)
             }
         }
@@ -1031,7 +1173,7 @@ mod test {
         impl OwnedDecoder for Pairs {
             type Item = Vec<u8>;
 
-            fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
+            unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
                 Ok(frame.to_vec())
             }
         }
@@ -1820,7 +1962,7 @@ mod test {
     }
     impl Framer for Editing {
         type Error = io::Error;
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(if src.is_empty() {
                 Frame::need_more(0)
             } else if src[0] == b'#' {
@@ -1833,7 +1975,7 @@ mod test {
                 Frame::ready_split(1..3, 1)
             })
         }
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(if src.is_empty() {
                 Frame::need_more(0)
             } else {
@@ -1843,14 +1985,14 @@ mod test {
     }
     impl BytesDecoder for Editing {
         type Item = Bytes;
-        fn decode_bytes(&mut self, mut src: BytesMut) -> io::Result<Bytes> {
+        unsafe fn decode_bytes(&mut self, mut src: BytesMut) -> io::Result<Bytes> {
             src[0] = 0xff;
             Ok(src.freeze())
         }
     }
     impl ViewDecoder for Editing {
         type Item<'a> = (&'a [u8], Vec<u8>);
-        fn decode_view<'a>(&mut self, src: &'a [u8]) -> io::Result<Self::Item<'a>> {
+        unsafe fn decode_view<'a>(&mut self, src: &'a [u8]) -> io::Result<Self::Item<'a>> {
             let mut transformed = src.to_vec();
             transformed[0] = 0xff;
             Ok((src, transformed))
@@ -1888,7 +2030,7 @@ mod test {
         struct RejectOnce(bool);
         impl Framer for RejectOnce {
             type Error = io::Error;
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
                 if src.is_empty() {
                     return Ok(Frame::need_more(0));
                 }
@@ -1899,13 +2041,14 @@ mod test {
                 assert_eq!(src, b"#abc");
                 Ok(Frame::ready_split(1.., 0))
             }
-            fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
-                self.frame(src)
+            unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+                // SAFETY: frame_eof forwards the same input and framing state.
+                unsafe { self.frame(src) }
             }
         }
         impl ViewDecoder for RejectOnce {
             type Item<'a> = &'a [u8];
-            fn decode_view<'a>(&mut self, src: &'a [u8]) -> io::Result<&'a [u8]> {
+            unsafe fn decode_view<'a>(&mut self, src: &'a [u8]) -> io::Result<&'a [u8]> {
                 Ok(src)
             }
         }
@@ -1926,7 +2069,7 @@ mod test {
         }
         impl Framer for RemoveHeader {
             type Error = io::Error;
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
                 if !self.removed && !src.is_empty() {
                     assert_eq!(src[0], b'#');
                     self.removed = true;
@@ -1938,13 +2081,14 @@ mod test {
                     Frame::ready_split(..2, 0)
                 })
             }
-            fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
-                self.frame(src)
+            unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+                // SAFETY: frame_eof forwards the same input and framing state.
+                unsafe { self.frame(src) }
             }
         }
         impl ViewDecoder for RemoveHeader {
             type Item<'a> = &'a [u8];
-            fn decode_view<'a>(&mut self, src: &'a [u8]) -> io::Result<&'a [u8]> {
+            unsafe fn decode_view<'a>(&mut self, src: &'a [u8]) -> io::Result<&'a [u8]> {
                 Ok(src)
             }
         }
@@ -1964,7 +2108,7 @@ mod test {
     impl Framer for DelimitedLines {
         type Error = io::Error;
 
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(match src.iter().position(|&b| b == b'\n') {
                 Some(end) if src[0] == b'#' => Frame::skip(end + 1),
                 Some(end) => Frame::ready_split(..end, 1),
@@ -1972,7 +2116,7 @@ mod test {
             })
         }
 
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             if src.is_empty() {
                 Ok(Frame::need_more(0))
             } else {
@@ -1984,7 +2128,7 @@ mod test {
     impl BytesDecoder for DelimitedLines {
         type Item = BytesMut;
 
-        fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
+        unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
             Ok(frame)
         }
     }
@@ -1992,7 +2136,7 @@ mod test {
     impl ViewDecoder for DelimitedLines {
         type Item<'a> = &'a [u8];
 
-        fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
+        unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
             Ok(frame)
         }
     }
@@ -2004,7 +2148,7 @@ mod test {
     impl Framer for Triples {
         type Error = io::Error;
 
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(if src.len() < 3 {
                 Frame::need_more(0)
             } else if self.copy {
@@ -2014,13 +2158,14 @@ mod test {
             })
         }
 
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             if src.is_empty() {
                 Ok(Frame::need_more(0))
             } else if src.len() < 3 {
                 Err(io::ErrorKind::UnexpectedEof.into())
             } else {
-                self.frame(src)
+                // SAFETY: frame_eof forwards the same input and framing state.
+                unsafe { self.frame(src) }
             }
         }
     }
@@ -2028,7 +2173,7 @@ mod test {
     impl BytesDecoder for Triples {
         type Item = BytesMut;
 
-        fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
+        unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
             Ok(frame)
         }
     }
@@ -2036,7 +2181,7 @@ mod test {
     impl ViewDecoder for Triples {
         type Item<'a> = &'a [u8];
 
-        fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
+        unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<&'a [u8]> {
             Ok(frame)
         }
     }
@@ -2090,7 +2235,7 @@ mod test {
         impl Framer for Fixed {
             type Error = io::Error;
 
-            fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+            unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
                 Ok(if src.len() < self.0 {
                     Frame::need_more(0)
                 } else {
@@ -2102,7 +2247,7 @@ mod test {
         impl BytesDecoder for Fixed {
             type Item = BytesMut;
 
-            fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
+            unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
                 Ok(frame)
             }
         }
@@ -2218,7 +2363,7 @@ mod test {
     impl Framer for InvalidFrame {
         type Error = io::Error;
 
-        fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+        unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(if src.is_empty() {
                 Frame::need_more(0)
             } else if self.split {
@@ -2228,15 +2373,16 @@ mod test {
             })
         }
 
-        fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
-            self.frame(src)
+        unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+            // SAFETY: frame_eof forwards the same input and framing state.
+            unsafe { self.frame(src) }
         }
     }
 
     impl BytesDecoder for InvalidFrame {
         type Item = BytesMut;
 
-        fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
+        unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<BytesMut> {
             Ok(frame)
         }
     }

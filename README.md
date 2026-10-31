@@ -129,7 +129,7 @@ struct ByteCodec;
 impl Framer for ByteCodec {
     type Error = io::Error;
 
-    fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+    unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
         Ok(if src.is_empty() {
             Frame::need_more(0)
         } else {
@@ -141,7 +141,7 @@ impl Framer for ByteCodec {
 impl BytesDecoder for ByteCodec {
     type Item = BytesMut;
 
-    fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Self::Item> {
+    unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Self::Item> {
         Ok(frame)
     }
 }
@@ -149,7 +149,7 @@ impl BytesDecoder for ByteCodec {
 impl ViewDecoder for ByteCodec {
     type Item<'a> = &'a [u8];
 
-    fn decode_view<'a>(
+    unsafe fn decode_view<'a>(
         &mut self,
         frame: &'a [u8],
     ) -> io::Result<Self::Item<'a>> {
@@ -160,7 +160,7 @@ impl ViewDecoder for ByteCodec {
 impl OwnedDecoder for ByteCodec {
     type Item = Vec<u8>;
 
-    fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
+    unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
         Ok(frame.to_vec())
     }
 }

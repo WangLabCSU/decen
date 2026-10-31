@@ -77,7 +77,7 @@ fn finish_owned<const REUSE: bool>(partial: &mut Vec<u8>, frame: &[u8]) -> Vec<u
 struct Lines<const COPY: bool>(usize);
 impl<const COPY: bool> Framer for Lines<COPY> {
     type Error = io::Error;
-    fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+    unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
         Ok(match self.line_end(src) {
             Some(end) => Self::ready(end),
             None => Frame::need_more(0),
@@ -129,19 +129,19 @@ impl<const COPY: bool> Lines<COPY> {
 }
 impl<const COPY: bool> BytesDecoder for Lines<COPY> {
     type Item = BytesMut;
-    fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Self::Item> {
+    unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Self::Item> {
         Ok(frame)
     }
 }
 impl<const COPY: bool> ViewDecoder for Lines<COPY> {
     type Item<'a> = &'a [u8];
-    fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<Self::Item<'a>> {
+    unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<Self::Item<'a>> {
         Ok(frame)
     }
 }
 impl<const COPY: bool> OwnedDecoder for Lines<COPY> {
     type Item = Vec<u8>;
-    fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
+    unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
         Ok(copy_frame(frame))
     }
 }
@@ -157,7 +157,7 @@ struct AccumulatingLines<const REUSE: bool> {
 impl<const REUSE: bool> Framer for AccumulatingLines<REUSE> {
     type Error = io::Error;
 
-    fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+    unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
         if let Some(end) = find_line_end(src) {
             Ok(Frame::ready_split(..end, 0))
         } else {
@@ -166,8 +166,9 @@ impl<const REUSE: bool> Framer for AccumulatingLines<REUSE> {
         }
     }
 
-    fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
-        let frame = self.frame(src)?;
+    unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
+        // SAFETY: frame_eof forwards the same input and framing state.
+        let frame = unsafe { self.frame(src)? };
         // The default EOF check cannot see bytes already consumed into partial.
         if frame.kind() == FrameKind::NeedMore && !self.partial.is_empty() {
             return Err(io::Error::new(
@@ -182,7 +183,7 @@ impl<const REUSE: bool> Framer for AccumulatingLines<REUSE> {
 impl<const REUSE: bool> OwnedDecoder for AccumulatingLines<REUSE> {
     type Item = Vec<u8>;
 
-    fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
+    unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
         Ok(finish_owned::<REUSE>(&mut self.partial, frame))
     }
 }
