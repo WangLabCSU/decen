@@ -3,6 +3,7 @@
 //! The `nightly` feature uses `Read::read_buf` and requires nightly Rust.
 
 use std::io::Read;
+use std::ops::Bound;
 
 use bytes::BytesMut;
 
@@ -11,11 +12,12 @@ use bytes::BytesMut;
 mod buffer;
 mod decoder;
 
-pub use self::decoder::{BytesDecoder, Frame, FrameKind, Framer, OwnedDecoder, ViewDecoder};
+pub use self::decoder::{BytesDecoder, Frame, FrameAction, Framer, OwnedDecoder, ViewDecoder};
 
 use self::buffer::Buffer;
-use self::decoder::{FrameInner, FrameReady};
 use crate::DEFAULT_BUF_SIZE;
+
+type FrameRange = (Bound<usize>, Bound<usize>);
 
 /// A buffered reader that decodes a byte stream into Items.
 ///
@@ -42,17 +44,13 @@ use crate::DEFAULT_BUF_SIZE;
 ///   retain those bytes across reads, allowing zero-copy decoding without
 ///   borrowing from the reader.
 ///
-/// With `decode_bytes`, the framed bytes are transferred without copying when
-/// the framer returns [`Frame::ready_split`], and copied when it returns
-/// [`Frame::ready_copy`]. For `ready_copy`, prefer
-/// [`decode_owned`](Self::decode_owned) when an owned result is needed and the
-/// decoder implements [`OwnedDecoder`], so it can copy only the data the Item
-/// needs.
-///
-/// `ready_copy` allows adjacent frames to overlap by selecting bytes
-/// independently of how many are consumed. If your framer uses `ready_copy`,
-/// consider implementing [`OwnedDecoder`] so callers can obtain owned Items
-/// without first copying the entire frame into a `BytesMut`.
+/// With `decode_bytes`, framed bytes are transferred without copying when
+/// consumption covers the prefix through the selection's end. If the selection
+/// overlaps input retained for the next Item, its bytes are copied into a new
+/// `BytesMut`. [`decode_view`](Self::decode_view) and
+/// [`decode_owned`](Self::decode_owned) always pass a slice to the decoder.
+/// Implement [`OwnedDecoder`] when callers could copy only the fields they need
+/// from overlapping frames instead of first copying the entire selection.
 ///
 /// Reading and buffering may still allocate or copy input bytes. Capacity is
 /// not a memory limit: large Items can grow the buffer, and retained owned
@@ -74,9 +72,9 @@ use crate::DEFAULT_BUF_SIZE;
 ///
 ///     unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
 ///         Ok(if src.len() < 2 {
-///             Frame::need_more(0)
+///             Frame::need_more()
 ///         } else {
-///             Frame::ready_split(..2, 0)
+///             Frame::ready(..2)
 ///         })
 ///     }
 /// }
@@ -171,25 +169,34 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     where
         D: BytesDecoder,
     {
-        let Some(ready) = self.frame_ready()? else {
+        let Some((range, consume)) = self.frame_ready()? else {
             return Ok(None);
         };
-        match ready {
-            FrameReady::Copy { range, consume } => {
-                let view = self.buffer.take_view(range.bounds(), consume);
-                let mut bytes = BytesMut::with_capacity(view.len());
-                bytes.extend_from_slice(view);
-                // SAFETY: frame_ready just selected these bytes with this
-                // decoder. Copying preserves the selection and decoder state.
-                unsafe { self.decoder.decode_bytes(bytes).map(Some) }
+        let bytes = match consume {
+            None => self.buffer.take_bytes(range, 0),
+            Some(consume) => {
+                let end = match range.1 {
+                    Bound::Included(end) => end.checked_add(1).expect("range end overflow"),
+                    Bound::Excluded(end) => end,
+                    Bound::Unbounded => self.buffer.len(),
+                };
+                if consume >= end {
+                    self.buffer
+                        .take_bytes((range.0, Bound::Excluded(end)), consume - end)
+                } else {
+                    let view = self
+                        .buffer
+                        .take_view((range.0, Bound::Excluded(end)), consume);
+                    let mut bytes = BytesMut::with_capacity(view.len());
+                    bytes.extend_from_slice(view);
+                    bytes
+                }
             }
-            FrameReady::Split { range, addition } => {
-                let bytes = self.buffer.take_bytes(range.bounds(), addition);
-                // SAFETY: extraction selects exactly the bytes from the most
-                // recent ready decision, without changing decoder state.
-                unsafe { self.decoder.decode_bytes(bytes).map(Some) }
-            }
-        }
+        };
+        // SAFETY: extraction supplies exactly the bytes selected by the most
+        // recent framing call. Copying, when needed, preserves their contents;
+        // neither path changes the decoder's parsing state.
+        unsafe { self.decoder.decode_bytes(bytes).map(Some) }
     }
 
     /// Decodes the next Item from a slice of framed bytes.
@@ -211,10 +218,13 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     where
         D: ViewDecoder,
     {
-        let Some(ready) = self.frame_ready()? else {
+        let Some((range, consume)) = self.frame_ready()? else {
             return Ok(None);
         };
-        let slice = Self::take_frame_view(&mut self.buffer, ready);
+        let slice = match consume {
+            Some(consume) => self.buffer.take_view(range, consume),
+            None => self.buffer.take_split_view(range, 0),
+        };
         // SAFETY: the slice is the selection from the immediately preceding
         // framing call. No decoder call or state change has intervened.
         Ok(Some(unsafe { self.decoder.decode_view(slice)? }))
@@ -239,30 +249,21 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     where
         D: OwnedDecoder,
     {
-        let Some(ready) = self.frame_ready()? else {
+        let Some((range, consume)) = self.frame_ready()? else {
             return Ok(None);
         };
-        let view = Self::take_frame_view(&mut self.buffer, ready);
+        let view = match consume {
+            Some(consume) => self.buffer.take_view(range, consume),
+            None => self.buffer.take_split_view(range, 0),
+        };
         // SAFETY: the slice is the selection from the immediately preceding
         // framing call. No decoder call or state change has intervened.
         Ok(Some(unsafe { self.decoder.decode_owned(view)? }))
     }
 
-    // Keep the view's borrow confined to the buffer so the decoder can be
-    // mutated independently. Inline to simplify bounds for each framer.
-    #[inline(always)]
-    fn take_frame_view(buffer: &mut Buffer, ready: FrameReady) -> &[u8] {
-        match ready {
-            FrameReady::Copy { range, consume } => buffer.take_view(range.bounds(), consume),
-            FrameReady::Split { range, addition } => {
-                buffer.take_split_view(range.bounds(), addition)
-            }
-        }
-    }
-
     // Keep framing in the caller's Item loop.
     #[inline(always)]
-    fn frame_ready(&mut self) -> Result<Option<FrameReady>, D::Error> {
+    fn frame_ready(&mut self) -> Result<Option<(FrameRange, Option<usize>)>, D::Error> {
         loop {
             let buf = self.buffer.buffer();
             let frame = if self.eof {
@@ -277,15 +278,17 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
                 // in the EOF branch apply when the source supplies data.
                 unsafe { self.decoder.frame(buf)? }
             };
-            match frame.0 {
-                FrameInner::Ready(ready) => return Ok(Some(ready)),
-
-                FrameInner::Skip(amount) => {
-                    self.buffer.consume(amount);
+            match frame.action() {
+                FrameAction::Ready(start, end) => {
+                    return Ok(Some(((*start, *end), frame.consume())));
                 }
 
-                FrameInner::NeedMore(consume) => {
-                    self.buffer.consume(consume);
+                FrameAction::Reframe => {
+                    self.buffer.consume(frame.consume().unwrap_or(0));
+                }
+
+                FrameAction::NeedMore => {
+                    self.buffer.consume(frame.consume().unwrap_or(0));
                     let nread = self.buffer.write_buf(&mut self.inner)?;
                     if nread == 0 {
                         std::hint::cold_path();
@@ -318,7 +321,7 @@ mod test {
 
     use bytes::{Bytes, BytesMut};
 
-    use super::{BytesDecoder, Frame, FramedRead, Framer, OwnedDecoder, ViewDecoder};
+    use super::{BytesDecoder, Frame, FrameAction, FramedRead, Framer, OwnedDecoder, ViewDecoder};
     use crate::test::allocations;
 
     // Minimal framing fixture for I/O tests, not a public format
@@ -334,23 +337,23 @@ mod test {
             if let Some(offset) = src[self.scanned..].iter().position(|&b| b == b'\n') {
                 let end = self.scanned + offset + 1;
                 self.scanned = 0;
-                Ok(Frame::ready_split(..end, 0))
+                Ok(Frame::ready(..end).with_consume(end))
             } else {
                 self.scanned = src.len();
-                Ok(Frame::need_more(0))
+                Ok(Frame::need_more())
             }
         }
         unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             // SAFETY: frame_eof forwards the same input and framing state.
             let frame = unsafe { self.frame(src)? };
-            if frame != Frame::need_more(0) {
+            if frame != Frame::need_more() {
                 return Ok(frame);
             }
             self.scanned = 0;
             Ok(if src.is_empty() {
-                Frame::need_more(0)
+                Frame::need_more()
             } else {
-                Frame::ready_split(.., 0)
+                Frame::ready(..).with_consume(src.len())
             })
         }
     }
@@ -723,7 +726,7 @@ mod test {
                 if src.is_empty() {
                     self.scanned = 0;
                     self.frame_len = 0;
-                    return Ok(Frame::need_more(0));
+                    return Ok(Frame::need_more());
                 }
                 assert_eq!(self.frame_len, 0, "a ready frame was not decoded");
                 // SAFETY: after NeedMore(0), the caller retains all previously
@@ -733,10 +736,10 @@ mod test {
                 if let Some(end) = tail.iter().position(|&b| b == b'\n') {
                     self.frame_len = self.scanned + end + 1;
                     self.scanned = 0;
-                    Ok(Frame::ready_split(..self.frame_len, 0))
+                    Ok(Frame::ready(..self.frame_len).with_consume(self.frame_len))
                 } else {
                     self.scanned = src.len();
-                    Ok(Frame::need_more(0))
+                    Ok(Frame::need_more())
                 }
             }
 
@@ -833,14 +836,14 @@ mod test {
         impl Framer for Closing {
             type Error = io::Error;
             unsafe fn frame(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
-                Ok(Frame::need_more(0))
+                Ok(Frame::need_more())
             }
             unsafe fn frame_eof(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
                 self.eof_calls += 1;
                 Ok(if self.remaining > 0 {
-                    Frame::ready_split(..0, 0)
+                    Frame::ready(..0)
                 } else {
-                    Frame::need_more(0)
+                    Frame::need_more()
                 })
             }
         }
@@ -870,7 +873,7 @@ mod test {
         impl Framer for Pending {
             type Error = io::Error;
             unsafe fn frame(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
-                Ok(Frame::need_more(0))
+                Ok(Frame::need_more())
             }
             unsafe fn frame_eof(&mut self, _: &[u8]) -> Result<Frame, Self::Error> {
                 Err(io::Error::new(ErrorKind::UnexpectedEof, "unfinished state"))
@@ -916,18 +919,20 @@ mod test {
                     match b {
                         b'\\' => self.escaped = true,
                         b'"' => self.quoted = !self.quoted,
-                        b'\n' if !self.quoted => return Ok(Frame::ready_split(..i + 1, 0)),
+                        b'\n' if !self.quoted => {
+                            return Ok(Frame::ready(..i + 1).with_consume(i + 1));
+                        }
                         _ => {}
                     }
                 }
             }
             self.scanned = src.len();
-            Ok(Frame::need_more(0))
+            Ok(Frame::need_more())
         }
         unsafe fn frame_eof(&mut self, src: &[u8]) -> Result<Frame, Self::Error> {
             // SAFETY: frame_eof forwards the same input and framing state.
             let frame = unsafe { self.frame(src)? };
-            if frame != Frame::need_more(0) {
+            if frame != Frame::need_more() {
                 return Ok(frame);
             }
             if self.quoted || self.escaped {
@@ -937,9 +942,9 @@ mod test {
                 ));
             }
             Ok(if src.is_empty() {
-                Frame::need_more(0)
+                Frame::need_more()
             } else {
-                Frame::ready_split(..src.len(), 0)
+                Frame::ready(..src.len()).with_consume(src.len())
             })
         }
     }
@@ -1052,13 +1057,13 @@ mod test {
         type Error = io::Error;
         unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             self.inputs.push((false, src.to_vec()));
-            self.frames.pop_front().unwrap_or(Ok(Frame::need_more(0)))
+            self.frames.pop_front().unwrap_or(Ok(Frame::need_more()))
         }
         unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             self.inputs.push((true, src.to_vec()));
             self.eof_frames
                 .pop_front()
-                .unwrap_or(Ok(Frame::need_more(0)))
+                .unwrap_or(Ok(Frame::need_more()))
         }
     }
     impl BytesDecoder for FrameScript {
@@ -1100,16 +1105,21 @@ mod test {
         ] {
             let expected = &input[bounds];
             let end = expected.as_ptr().addr() - input.as_ptr().addr() + expected.len();
-            for copy in [false, true] {
-                let consume = if copy { 1 } else { end };
-                let decision = if copy {
-                    Frame::ready_copy(bounds, consume)
-                } else {
-                    Frame::ready_split(bounds, 0)
+            for requested in [None, Some(0), Some(1), Some(end)] {
+                let decision = {
+                    let mut frame = Frame::ready(bounds);
+                    if let Some(consume) = requested {
+                        frame = frame.with_consume(consume);
+                    }
+                    frame
                 };
+                let consume = requested.unwrap_or(end);
                 for mode in 0..3 {
-                    let codec =
-                        FrameScript::new([Frame::need_more(0), Frame::skip(1), decision.clone()]);
+                    let codec = FrameScript::new([
+                        Frame::need_more(),
+                        Frame::reframe().with_consume(1),
+                        decision.clone(),
+                    ]);
                     let mut reader =
                         FramedRead::with_capacity(&b"#abcdef"[..], codec, input.len() + 1);
                     let actual = match mode {
@@ -1127,7 +1137,7 @@ mod test {
             (Unbounded, Included(usize::MAX)),
         ] {
             for mode in 0..3 {
-                let codec = FrameScript::new([Frame::need_more(0), Frame::ready_split(bounds, 0)]);
+                let codec = FrameScript::new([Frame::need_more(), Frame::ready(bounds)]);
                 let mut reader = FramedRead::with_capacity(&input[..], codec, input.len());
                 assert!(
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
@@ -1137,6 +1147,8 @@ mod test {
                     }))
                     .is_err()
                 );
+                assert_eq!(reader.buffer.buffer(), input);
+                assert!(reader.decoder().decoded.is_empty());
             }
         }
     }
@@ -1149,9 +1161,9 @@ mod test {
 
             unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
                 Ok(if src.len() < 2 {
-                    Frame::need_more(0)
+                    Frame::need_more()
                 } else {
-                    Frame::ready_split(..2, 0)
+                    Frame::ready(..2).with_consume(2)
                 })
             }
         }
@@ -1234,7 +1246,7 @@ mod test {
         // Cover no allocation, uninitialized capacity, and a consumed full
         // buffer.
         for (capacity, consumed) in [(0, 0), (4, 0), (4, 4)] {
-            let codec = FrameScript::new([Frame::ready_split(..1, 0)]);
+            let codec = FrameScript::new([Frame::ready(..1).with_consume(1)]);
             let mut reader = FramedRead::with_capacity(&b"x"[..], codec, capacity);
             if consumed != 0 {
                 reader.buffer.extend_from_slice(b"abcd");
@@ -1266,13 +1278,11 @@ mod test {
     fn need_more_at_eof_keeps_partial_input_until_the_source_resumes() {
         for owned in [false, true] {
             let mut codec = FrameScript::new([
-                Frame::need_more(0),
-                Frame::need_more(0),
-                Frame::ready_split(..2, 0),
+                Frame::need_more(),
+                Frame::need_more(),
+                Frame::ready(..2).with_consume(2),
             ]);
-            codec.eof_frames = std::iter::repeat_n(Frame::need_more(0), 2)
-                .map(Ok)
-                .collect();
+            codec.eof_frames = std::iter::repeat_n(Frame::need_more(), 2).map(Ok).collect();
             let source = Script::new([Step::Data(b"a"), Step::Eof, Step::Eof, Step::Data(b"b")]);
             let mut reader = FramedRead::new(source, codec);
             if owned {
@@ -1294,9 +1304,9 @@ mod test {
         for (consume, expected) in [(0, &b"#abc"[..]), (1, &b"abc"[..]), (2, &b"bc"[..])] {
             for mode in 0..3 {
                 let codec = FrameScript::new([
-                    Frame::need_more(0),
-                    Frame::need_more(consume),
-                    Frame::ready_split(.., 0),
+                    Frame::need_more(),
+                    Frame::need_more().with_consume(consume),
+                    Frame::ready(..).with_consume(expected.len()),
                 ]);
                 let source = Script::new([Step::Data(b"#a"), Step::Data(b"bc")]);
                 let mut reader = FramedRead::with_capacity(source, codec, 16);
@@ -1332,11 +1342,11 @@ mod test {
                     _ => Step::Panic,
                 };
                 let codec = FrameScript::new([
-                    Frame::need_more(0),
-                    Frame::need_more(1),
-                    Frame::ready_split(.., 0),
-                    Frame::need_more(0),
-                    Frame::ready_split(.., 0),
+                    Frame::need_more(),
+                    Frame::need_more().with_consume(1),
+                    Frame::ready(..).with_consume(1),
+                    Frame::need_more(),
+                    Frame::ready(..).with_consume(1),
                 ]);
                 let source = Script::new([Step::Data(b"#a"), step, Step::Data(b"b")]);
                 let mut reader = FramedRead::with_capacity(source, codec, 16);
@@ -1377,11 +1387,11 @@ mod test {
         ] {
             for mode in 0..3 {
                 let mut codec = FrameScript::new([
-                    Frame::need_more(0),
-                    Frame::need_more(0),
-                    Frame::ready_split(.., 0),
+                    Frame::need_more(),
+                    Frame::need_more(),
+                    Frame::ready(..).with_consume(expected.len()),
                 ]);
-                codec.eof_frames = [Frame::need_more(consume), Frame::need_more(0)]
+                codec.eof_frames = [Frame::need_more().with_consume(consume), Frame::need_more()]
                     .into_iter()
                     .map(Ok)
                     .collect();
@@ -1411,16 +1421,20 @@ mod test {
     }
 
     #[test]
-    fn excessive_skip_and_need_more_panic_before_consuming_or_reading() {
+    fn excessive_reframe_and_need_more_consumption_panic_before_consuming_or_reading() {
         for eof in [false, true] {
             for input in [&b""[..], &b"abc"[..]] {
                 for amount in [input.len() + 1, usize::MAX] {
-                    for action in [Frame::skip(amount), Frame::need_more(amount)] {
+                    for action in [
+                        Frame::reframe().with_consume(amount),
+                        Frame::need_more().with_consume(amount),
+                    ] {
                         for mode in 0..3 {
                             let mut codec = FrameScript::default();
-                            let decisions = [action.clone(), Frame::ready_split(.., 0)]
-                                .into_iter()
-                                .map(Ok);
+                            let decisions =
+                                [action.clone(), Frame::ready(..).with_consume(input.len())]
+                                    .into_iter()
+                                    .map(Ok);
                             if eof {
                                 codec.eof_frames.extend(decisions);
                             } else {
@@ -1461,13 +1475,15 @@ mod test {
     fn frame_ranges_and_consumption_preserve_suffix_and_borrow_original_addresses() {
         for owned in [false, true] {
             let mut codec = FrameScript::new([
-                Frame::need_more(0),
-                Frame::skip(2),
-                Frame::ready_split(1..4, 2),
-                Frame::ready_split(1..3, 2),
-                Frame::need_more(0),
+                Frame::need_more(),
+                Frame::reframe().with_consume(2),
+                Frame::ready(1..4).with_consume(6),
+                Frame::ready(1..3).with_consume(5),
+                Frame::need_more(),
             ]);
-            codec.eof_frames.push_back(Ok(Frame::skip(4)));
+            codec
+                .eof_frames
+                .push_back(Ok(Frame::reframe().with_consume(4)));
             let source = Script::new([Step::Data(b"##<abc>!<de>!tail")]);
             let mut reader = FramedRead::with_capacity(source, codec, 32);
             let mut kept = Vec::new();
@@ -1508,14 +1524,14 @@ mod test {
     }
 
     #[test]
-    fn need_more_after_skipping_preserves_scan_phase_across_read_error_and_compact() {
+    fn need_more_after_reframe_preserves_scan_phase_across_read_error_and_compact() {
         let codec = FrameScript::new([
-            Frame::need_more(0),
-            Frame::skip(2),
-            Frame::need_more(0),
-            Frame::need_more(0), // Reframing after Interrupted.
-            Frame::need_more(0), // Reframing after WouldBlock.
-            Frame::ready_split(1..3, 1),
+            Frame::need_more(),
+            Frame::reframe().with_consume(2),
+            Frame::need_more(),
+            Frame::need_more(), // Reframing after Interrupted.
+            Frame::need_more(), // Reframing after WouldBlock.
+            Frame::ready(1..3).with_consume(4),
         ]);
         let source = Script::new([
             Step::Data(b"##<a"),
@@ -1546,18 +1562,18 @@ mod test {
     }
 
     #[test]
-    fn eof_skipping_can_precede_ready_empty_items_and_source_resumption() {
+    fn eof_reframe_can_precede_ready_empty_items_and_source_resumption() {
         let mut codec = FrameScript::new([
-            Frame::need_more(0),
-            Frame::need_more(0),
-            Frame::ready_split(..1, 0),
+            Frame::need_more(),
+            Frame::need_more(),
+            Frame::ready(..1).with_consume(1),
         ]);
         codec.eof_frames = [
-            Frame::skip(0),
-            Frame::skip(1),
-            Frame::ready_split(1..2, 1),
-            Frame::ready_split(0..0, 0),
-            Frame::need_more(0),
+            Frame::reframe(),
+            Frame::reframe().with_consume(1),
+            Frame::ready(1..2).with_consume(3),
+            Frame::ready(0..0),
+            Frame::need_more(),
         ]
         .into_iter()
         .map(Ok)
@@ -1587,14 +1603,14 @@ mod test {
         for eof in [false, true] {
             for owned in [false, true] {
                 for action in [
-                    Frame::ready_split(..2, 0),
-                    Frame::ready_split(std::ops::Range { start: 1, end: 0 }, 0),
-                    Frame::ready_copy(..2, 0),
-                    Frame::ready_copy(std::ops::Range { start: 1, end: 0 }, 0),
+                    Frame::ready(..2).with_consume(2),
+                    Frame::ready(std::ops::Range { start: 1, end: 0 }).with_consume(1),
+                    Frame::ready(..2),
+                    Frame::ready(std::ops::Range { start: 1, end: 0 }),
                 ] {
-                    let mut codec = FrameScript::new([Frame::need_more(0)]);
+                    let mut codec = FrameScript::new([Frame::need_more()]);
                     if eof {
-                        codec.frames.push_back(Ok(Frame::need_more(0)));
+                        codec.frames.push_back(Ok(Frame::need_more()));
                         codec.eof_frames.push_back(Ok(action));
                     } else {
                         codec.frames.push_back(Ok(action));
@@ -1615,41 +1631,93 @@ mod test {
     }
 
     #[test]
-    fn overflowing_split_consumption_panics_without_decoding_or_consuming() {
-        fn check(source: impl Read, end: usize, addition: usize) {
+    fn excessive_ready_consumption_panics_without_decoding_or_consuming() {
+        fn check(source: impl Read, end: usize, consume: usize, mode: usize) {
             let codec = FrameScript::new([
-                Frame::need_more(0),
-                Frame::ready_split(..end, addition),
-                Frame::ready_split(.., 0),
+                Frame::need_more(),
+                Frame::ready(..end).with_consume(consume),
+                Frame::ready(..).with_consume(3),
             ]);
             let mut reader = FramedRead::new(source, codec);
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = reader.decode_view().unwrap();
+            let outcome = catch_unwind(AssertUnwindSafe(|| match mode {
+                0 => reader.decode_bytes().map(|_| ()),
+                1 => reader.decode_view().map(|_| ()),
+                _ => reader.decode_owned().map(|_| ()),
             }));
-            assert!(outcome.is_err(), "overflowing consumption must be rejected");
+            assert!(outcome.is_err(), "invalid consumption must be rejected");
             assert!(reader.decoder().decoded.is_empty());
+            assert_eq!(reader.buffer(), b"abc");
             assert_eq!(reader.decode_view().unwrap().unwrap(), b"abc");
         }
-        for (end, addition) in [(1, usize::MAX), (2, usize::MAX), (3, usize::MAX - 1)] {
-            check(Script::new([Step::Data(b"abc")]), end, addition);
-            check(Cursor::new(&b"abc"[..]), end, addition);
-            check(Cursor::new(b"abc".to_vec()), end, addition);
-            check(
-                Cursor::new(b"abc".to_vec().into_boxed_slice()),
-                end,
-                addition,
-            );
+        for (end, consume) in [
+            (1, usize::MAX),
+            (2, usize::MAX),
+            (3, usize::MAX - 1),
+            (2, 4),
+        ] {
+            for mode in 0..3 {
+                check(Script::new([Step::Data(b"abc")]), end, consume, mode);
+                check(Cursor::new(&b"abc"[..]), end, consume, mode);
+                check(Cursor::new(b"abc".to_vec()), end, consume, mode);
+                check(
+                    Cursor::new(b"abc".to_vec().into_boxed_slice()),
+                    end,
+                    consume,
+                    mode,
+                );
+            }
         }
     }
 
     #[test]
-    fn zero_byte_skipping_and_borrowed_lookahead_keep_unconsumed_overlap() {
+    fn consumption_is_independent_of_the_next_action_in_all_decode_modes() {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        for mode in 0..3 {
+            for (action, expected, remaining, reads) in [
+                (FrameAction::Reframe, &b"cd"[..], &b""[..], 0),
+                (FrameAction::NeedMore, &b"cdef"[..], &b""[..], 1),
+                (
+                    FrameAction::Ready(Unbounded, Excluded(2)),
+                    &b"ab"[..],
+                    &b"cd"[..],
+                    0,
+                ),
+                (
+                    FrameAction::Ready(Unbounded, Excluded(3)),
+                    &b"abc"[..],
+                    &b"cd"[..],
+                    0,
+                ),
+            ] {
+                let codec = FrameScript::new([
+                    Frame::new(action).with_consume(2),
+                    Frame::ready(..).with_consume(expected.len()),
+                ]);
+                let mut reader =
+                    FramedRead::with_capacity(Script::new([Step::Data(b"ef")]), codec, 16);
+                reader.buffer.extend_from_slice(b"abcd");
+                let actual = match mode {
+                    0 => reader.decode_bytes().unwrap().unwrap().to_vec(),
+                    1 => reader.decode_view().unwrap().unwrap().to_vec(),
+                    _ => reader.decode_owned().unwrap().unwrap(),
+                };
+                assert_eq!(actual, expected);
+                assert_eq!(reader.buffer(), remaining);
+                assert_eq!(reader.reader().reads, reads);
+                assert_eq!(reader.decoder().decoded, [expected.to_vec()]);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_consumption_reframing_and_borrowed_lookahead_keep_overlap() {
         let codec = FrameScript::new([
-            Frame::skip(0),
-            Frame::need_more(0),
-            Frame::ready_copy(1..4, 2),
-            Frame::skip(0),
-            Frame::ready_split(0..2, 1),
+            Frame::reframe(),
+            Frame::need_more(),
+            Frame::ready(1..4).with_consume(2),
+            Frame::reframe(),
+            Frame::ready(0..2).with_consume(3),
         ]);
         let source = Script::new([Step::Data(b"<abc>")]);
         let mut reader = FramedRead::new(source, codec);
@@ -1664,16 +1732,16 @@ mod test {
     }
 
     #[test]
-    fn ready_ranges_and_additions_transfer_without_copying() {
+    fn ready_ranges_and_consumption_transfer_without_copying() {
         let input = b"a\0\xffbcdef";
         for start in 0..=input.len() {
             for end in start..=input.len() {
                 for addition in 0..=input.len() - end {
                     let consume = end + addition;
                     let codec = FrameScript::new([
-                        Frame::need_more(0),
-                        Frame::ready_split(start..end, addition),
-                        Frame::ready_split(..input.len() - consume, 0),
+                        Frame::need_more(),
+                        Frame::ready(start..end).with_consume(consume),
+                        Frame::ready(..input.len() - consume).with_consume(input.len() - consume),
                     ]);
                     let source = Script::new([Step::Data(input)]);
                     let mut reader = FramedRead::with_capacity(source, codec, 16);
@@ -1696,16 +1764,17 @@ mod test {
     }
 
     #[test]
-    fn ready_copy_copies_only_owned_items_for_every_valid_range_and_consumption() {
+    fn ready_transfers_consumed_selections_and_copies_overlaps_for_owned_bytes() {
         let input = b"a\0\xffbcdef";
         for owned in [false, true] {
             for start in 0..=input.len() {
                 for end in start..=input.len() {
                     for consume in 0..=input.len() {
                         let codec = FrameScript::new([
-                            Frame::need_more(0),
-                            Frame::ready_copy(start..end, consume),
-                            Frame::ready_split(..input.len() - consume, 0),
+                            Frame::need_more(),
+                            Frame::ready(start..end).with_consume(consume),
+                            Frame::ready(..input.len() - consume)
+                                .with_consume(input.len() - consume),
                         ]);
                         let source = Script::new([Step::Data(input)]);
                         let mut reader = FramedRead::with_capacity(source, codec, 16);
@@ -1723,7 +1792,7 @@ mod test {
                         };
                         let original = reader.reader().destinations[0];
                         if start != end {
-                            assert_eq!(address == original + start, !owned);
+                            assert_eq!(address == original + start, !owned || consume >= end);
                         }
                         let suffix = reader.decode_bytes().unwrap().unwrap();
                         if !suffix.is_empty() {
@@ -1744,11 +1813,11 @@ mod test {
     #[test]
     fn copied_owned_items_and_borrowed_overlaps_keep_the_suffix_in_original_storage() {
         let codec = FrameScript::new([
-            Frame::need_more(0),
-            Frame::ready_copy(1..5, 1),
-            Frame::ready_copy(1..3, 2),
-            Frame::ready_copy(0..3, 1),
-            Frame::ready_split(.., 0),
+            Frame::need_more(),
+            Frame::ready(1..5).with_consume(1),
+            Frame::ready(1..3).with_consume(2),
+            Frame::ready(0..3).with_consume(1),
+            Frame::ready(..).with_consume(4),
         ]);
         let mut reader = FramedRead::new(Script::new([Step::Data(b"abcdefgh")]), codec);
         let first = reader.decode_bytes().unwrap().unwrap();
@@ -1773,13 +1842,13 @@ mod test {
     fn copied_items_survive_refill_errors_short_reads_and_compact() {
         for capacity in [3, 8] {
             let codec = FrameScript::new([
-                Frame::need_more(0),
-                Frame::ready_copy(0..3, 1),
-                Frame::need_more(0),
-                Frame::need_more(0),
-                Frame::need_more(0), // Reframing after each returned source error.
-                Frame::need_more(0),
-                Frame::ready_split(..4, 0),
+                Frame::need_more(),
+                Frame::ready(0..3).with_consume(1),
+                Frame::need_more(),
+                Frame::need_more(),
+                Frame::need_more(), // Reframing after each returned source error.
+                Frame::need_more(),
+                Frame::ready(..4).with_consume(4),
             ]);
             let source = Script::new([
                 Step::Data(b"abc"),
@@ -1812,9 +1881,9 @@ mod test {
     #[test]
     fn mutating_an_owned_copy_does_not_change_the_unconsumed_overlap() {
         let codec = FrameScript::new([
-            Frame::need_more(0),
-            Frame::ready_copy(..4, 1),
-            Frame::ready_split(.., 0),
+            Frame::need_more(),
+            Frame::ready(..4).with_consume(1),
+            Frame::ready(..).with_consume(3),
         ]);
         let mut reader = FramedRead::with_capacity(&b"abcd"[..], codec, 8);
         let first = reader.decode_bytes().unwrap().unwrap();
@@ -1829,23 +1898,27 @@ mod test {
         for eof in [false, true] {
             for mode in 0..3 {
                 for (action, selected, suffix) in [
-                    (Frame::ready_split(1..2, 2), &b"x"[..], &b"tail"[..]),
-                    (Frame::ready_copy(1..4, 2), &b"x>!"[..], &b">!tail"[..]),
+                    (Frame::ready(1..2).with_consume(4), &b"x"[..], &b"tail"[..]),
+                    (
+                        Frame::ready(1..4).with_consume(2),
+                        &b"x>!"[..],
+                        &b">!tail"[..],
+                    ),
                 ] {
                     let mut codec = FrameScript::new([
-                        Frame::need_more(0),
-                        Frame::ready_split(..1, 0),
-                        Frame::skip(1),
+                        Frame::need_more(),
+                        Frame::ready(..1).with_consume(1),
+                        Frame::reframe().with_consume(1),
                     ]);
                     let frames = [
                         action,
-                        Frame::ready_split(..1, 0),
-                        Frame::ready_split(.., 0),
+                        Frame::ready(..1).with_consume(1),
+                        Frame::ready(..).with_consume(suffix.len() - 1),
                     ]
                     .into_iter()
                     .map(Ok);
                     if eof {
-                        codec.frames.push_back(Ok(Frame::need_more(0)));
+                        codec.frames.push_back(Ok(Frame::need_more()));
                         codec.eof_frames.extend(frames);
                     } else {
                         codec.frames.extend(frames);
@@ -1877,16 +1950,16 @@ mod test {
     #[test]
     fn copied_overlap_at_eof_can_be_consumed_before_source_resumes() {
         let mut codec = FrameScript::new([
-            Frame::need_more(0),
-            Frame::need_more(0),
-            Frame::ready_split(..1, 0),
+            Frame::need_more(),
+            Frame::need_more(),
+            Frame::ready(..1).with_consume(1),
         ]);
         codec.eof_frames = [
-            Frame::ready_copy(0..3, 0),
-            Frame::skip(0),
-            Frame::ready_copy(1..3, 1),
-            Frame::skip(2),
-            Frame::need_more(0),
+            Frame::ready(0..3).with_consume(0),
+            Frame::reframe(),
+            Frame::ready(1..3).with_consume(1),
+            Frame::reframe().with_consume(2),
+            Frame::need_more(),
         ]
         .into_iter()
         .map(Ok)
@@ -1915,11 +1988,11 @@ mod test {
     #[test]
     fn eof_is_rechecked_after_source_errors_and_none_before_reading_resumes() {
         let mut codec = FrameScript::new([
-            Frame::need_more(0),
-            Frame::ready_split(..1, 0),
-            Frame::need_more(0),
+            Frame::need_more(),
+            Frame::ready(..1).with_consume(1),
+            Frame::need_more(),
         ]);
-        codec.eof_frames.push_back(Ok(Frame::ready_split(..0, 0)));
+        codec.eof_frames.push_back(Ok(Frame::ready(..0)));
         let source = Script::new([
             Step::Eof,
             Step::Error(ErrorKind::WouldBlock),
@@ -1964,22 +2037,22 @@ mod test {
         type Error = io::Error;
         unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(if src.is_empty() {
-                Frame::need_more(0)
+                Frame::need_more()
             } else if src[0] == b'#' {
-                Frame::skip(1)
+                Frame::reframe().with_consume(1)
             } else if src.len() < 8 {
-                Frame::need_more(0)
+                Frame::need_more()
             } else if self.copy {
-                Frame::ready_copy(1..3, 2)
+                Frame::ready(1..3).with_consume(2)
             } else {
-                Frame::ready_split(1..3, 1)
+                Frame::ready(1..3).with_consume(4)
             })
         }
         unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(if src.is_empty() {
-                Frame::need_more(0)
+                Frame::need_more()
             } else {
-                Frame::ready_split(.., 0)
+                Frame::ready(..).with_consume(src.len())
             })
         }
     }
@@ -2032,14 +2105,14 @@ mod test {
             type Error = io::Error;
             unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
                 if src.is_empty() {
-                    return Ok(Frame::need_more(0));
+                    return Ok(Frame::need_more());
                 }
                 if !self.0 {
                     self.0 = true;
                     return Err(io::Error::new(ErrorKind::InvalidData, "header rejected"));
                 }
                 assert_eq!(src, b"#abc");
-                Ok(Frame::ready_split(1.., 0))
+                Ok(Frame::ready(1..).with_consume(src.len()))
             }
             unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
                 // SAFETY: frame_eof forwards the same input and framing state.
@@ -2062,7 +2135,7 @@ mod test {
     }
 
     #[test]
-    fn need_more_keeps_the_prefix_after_skipping_across_a_dirty_read_error() {
+    fn need_more_keeps_the_prefix_after_reframe_across_a_dirty_read_error() {
         #[derive(Default)]
         struct RemoveHeader {
             removed: bool,
@@ -2073,12 +2146,12 @@ mod test {
                 if !self.removed && !src.is_empty() {
                     assert_eq!(src[0], b'#');
                     self.removed = true;
-                    return Ok(Frame::skip(1));
+                    return Ok(Frame::reframe().with_consume(1));
                 }
                 Ok(if src.len() < 2 {
-                    Frame::need_more(0)
+                    Frame::need_more()
                 } else {
-                    Frame::ready_split(..2, 0)
+                    Frame::ready(..2).with_consume(2)
                 })
             }
             unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
@@ -2110,17 +2183,17 @@ mod test {
 
         unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(match src.iter().position(|&b| b == b'\n') {
-                Some(end) if src[0] == b'#' => Frame::skip(end + 1),
-                Some(end) => Frame::ready_split(..end, 1),
-                None => Frame::need_more(0),
+                Some(end) if src[0] == b'#' => Frame::reframe().with_consume(end + 1),
+                Some(end) => Frame::ready(..end).with_consume(end + 1),
+                None => Frame::need_more(),
             })
         }
 
         unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             if src.is_empty() {
-                Ok(Frame::need_more(0))
+                Ok(Frame::need_more())
             } else {
-                Ok(Frame::ready_split(.., 0))
+                Ok(Frame::ready(..).with_consume(src.len()))
             }
         }
     }
@@ -2141,26 +2214,22 @@ mod test {
         }
     }
 
-    struct Triples {
-        copy: bool,
-    }
+    struct Triples;
 
     impl Framer for Triples {
         type Error = io::Error;
 
         unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(if src.len() < 3 {
-                Frame::need_more(0)
-            } else if self.copy {
-                Frame::ready_copy(..3, 3)
+                Frame::need_more()
             } else {
-                Frame::ready_split(..3, 0)
+                Frame::ready(..3).with_consume(3)
             })
         }
 
         unsafe fn frame_eof(&mut self, src: &[u8]) -> io::Result<Frame> {
             if src.is_empty() {
-                Ok(Frame::need_more(0))
+                Ok(Frame::need_more())
             } else if src.len() < 3 {
                 Err(io::ErrorKind::UnexpectedEof.into())
             } else {
@@ -2213,8 +2282,8 @@ mod test {
         // Three-byte Items straddle an eight-byte buffer. A pending tail
         // prevents the empty-buffer reset from masking a failure to reclaim
         // the prefix.
-        for (view, copy) in [(true, false), (false, true), (false, false)] {
-            let mut reader = FramedRead::with_capacity(Repeating::default(), Triples { copy }, 8);
+        for view in [true, false] {
+            let mut reader = FramedRead::with_capacity(Repeating::default(), Triples, 8);
             for _ in 0..100_000 {
                 if view {
                     assert_eq!(reader.decode_view().unwrap().unwrap(), b"ab\n");
@@ -2237,9 +2306,9 @@ mod test {
 
             unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
                 Ok(if src.len() < self.0 {
-                    Frame::need_more(0)
+                    Frame::need_more()
                 } else {
-                    Frame::ready_split(..self.0, 0)
+                    Frame::ready(..self.0).with_consume(self.0)
                 })
             }
         }
@@ -2285,9 +2354,9 @@ mod test {
     #[test]
     fn minimum_capacities_read_input_and_handle_empty_sources() {
         for capacity in [0, 1] {
-            for (view, copy) in [(true, false), (false, true), (false, false)] {
+            for view in [true, false] {
                 let (mut reader, count) = allocations(|| {
-                    FramedRead::with_capacity(Cursor::new(b"ab\ncd\n"), Triples { copy }, capacity)
+                    FramedRead::with_capacity(Cursor::new(b"ab\ncd\n"), Triples, capacity)
                 });
                 if capacity == 0 {
                     assert_eq!(count, 0);
@@ -2365,11 +2434,11 @@ mod test {
 
         unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
             Ok(if src.is_empty() {
-                Frame::need_more(0)
+                Frame::need_more()
             } else if self.split {
-                Frame::ready_split(..3, 0)
+                Frame::ready(..3).with_consume(3)
             } else {
-                Frame::ready_copy(..1, 3)
+                Frame::ready(..1).with_consume(3)
             })
         }
 

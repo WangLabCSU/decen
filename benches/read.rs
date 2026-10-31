@@ -16,7 +16,9 @@ use std::mem;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BytesMut};
-use decen::read::{BytesDecoder, Frame, FrameKind, FramedRead, Framer, OwnedDecoder, ViewDecoder};
+use decen::read::{
+    BytesDecoder, Frame, FrameAction, FramedRead, Framer, OwnedDecoder, ViewDecoder,
+};
 use memchr::memchr;
 
 #[path = "src/table.rs"]
@@ -26,11 +28,10 @@ const CAPACITY: usize = 8 << 10;
 // One complete rotation gives every method each timing position once.
 const SAMPLES: usize = METHODS.len();
 const ROUNDS: usize = 4;
-const METHODS: [&str; 13] = [
+const METHODS: [&str; 12] = [
     "FramedRead::decode_bytes()",
-    "Frame::ready_split(..end, 0); FramedRead::decode_view()",
-    "Frame::ready_copy(..end, end); FramedRead::decode_view()",
-    "FramedRead<_, Lines<false>>::decode_owned()",
+    "FramedRead::decode_view()",
+    "FramedRead::decode_owned()",
     "BufReader::fill_buf() + consume(n)",
     "BufReader::fill_buf() + finish_owned::<true>() + consume(n)",
     "BufReader::read_until(b'\\n', &mut Vec::new())",
@@ -74,17 +75,17 @@ fn finish_owned<const REUSE: bool>(partial: &mut Vec<u8>, frame: &[u8]) -> Vec<u
 
 // Remember how much of the pending frame has already been searched for LF.
 #[derive(Default)]
-struct Lines<const COPY: bool>(usize);
-impl<const COPY: bool> Framer for Lines<COPY> {
+struct Lines(usize);
+impl Framer for Lines {
     type Error = io::Error;
     unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
         Ok(match self.line_end(src) {
-            Some(end) => Self::ready(end),
-            None => Frame::need_more(0),
+            Some(end) => Frame::ready(..end),
+            None => Frame::need_more(),
         })
     }
 }
-impl<const COPY: bool> Lines<COPY> {
+impl Lines {
     // Share this scanner with the direct BytesMut baseline so only buffering
     // and frame delivery differ, not the LF search or partial-line bookkeeping.
     #[inline(always)]
@@ -99,16 +100,6 @@ impl<const COPY: bool> Lines<COPY> {
         } else {
             self.0 = src.len();
             None
-        }
-    }
-    #[inline(always)]
-    fn ready(end: usize) -> Frame {
-        // Fix the decision for the whole run. Both choices select and consume
-        // the same bytes; decode_view borrows them in either case.
-        if COPY {
-            Frame::ready_copy(..end, end)
-        } else {
-            Frame::ready_split(..end, 0)
         }
     }
 
@@ -127,19 +118,19 @@ impl<const COPY: bool> Lines<COPY> {
         }
     }
 }
-impl<const COPY: bool> BytesDecoder for Lines<COPY> {
+impl BytesDecoder for Lines {
     type Item = BytesMut;
     unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Self::Item> {
         Ok(frame)
     }
 }
-impl<const COPY: bool> ViewDecoder for Lines<COPY> {
+impl ViewDecoder for Lines {
     type Item<'a> = &'a [u8];
     unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<Self::Item<'a>> {
         Ok(frame)
     }
 }
-impl<const COPY: bool> OwnedDecoder for Lines<COPY> {
+impl OwnedDecoder for Lines {
     type Item = Vec<u8>;
     unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
         Ok(copy_frame(frame))
@@ -159,10 +150,10 @@ impl<const REUSE: bool> Framer for AccumulatingLines<REUSE> {
 
     unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
         if let Some(end) = find_line_end(src) {
-            Ok(Frame::ready_split(..end, 0))
+            Ok(Frame::ready(..end))
         } else {
             self.partial.extend_from_slice(src);
-            Ok(Frame::need_more(src.len()))
+            Ok(Frame::need_more().with_consume(src.len()))
         }
     }
 
@@ -170,7 +161,7 @@ impl<const REUSE: bool> Framer for AccumulatingLines<REUSE> {
         // SAFETY: frame_eof forwards the same input and framing state.
         let frame = unsafe { self.frame(src)? };
         // The default EOF check cannot see bytes already consumed into partial.
-        if frame.kind() == FrameKind::NeedMore && !self.partial.is_empty() {
+        if frame.action() == &FrameAction::NeedMore && !self.partial.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "incomplete line",
@@ -202,10 +193,8 @@ fn observe<const VERIFY: bool>(frame: &[u8], totals: &mut (usize, usize)) {
 }
 
 #[inline(never)]
-fn framed<R: Read, const MODE: usize, const COPY: bool, const VERIFY: bool>(
-    source: R,
-) -> (usize, usize) {
-    let mut reader = FramedRead::with_capacity(source, Lines::<COPY>::default(), CAPACITY);
+fn framed<R: Read, const MODE: usize, const VERIFY: bool>(source: R) -> (usize, usize) {
+    let mut reader = FramedRead::with_capacity(source, Lines::default(), CAPACITY);
     let mut totals = (0, 0);
     match MODE {
         0 => {
@@ -291,7 +280,7 @@ fn standard<R: Read, const MODE: usize, const REUSE: bool, const VERIFY: bool>(
 #[inline(never)]
 fn bytes_mut<R: Read, const MODE: usize, const VERIFY: bool>(mut source: R) -> (usize, usize) {
     let mut buffer = BytesMut::with_capacity(CAPACITY);
-    let mut lines = Lines::<false>::default();
+    let mut lines = Lines::default();
     let mut totals = (0, 0);
     loop {
         if let Some(end) = lines.line_end(&buffer) {
@@ -350,19 +339,18 @@ fn bytes_mut<R: Read, const MODE: usize, const VERIFY: bool>(mut source: R) -> (
 
 fn run<R: Read, const VERIFY: bool>(source: R, mode: usize) -> (usize, usize) {
     match mode {
-        0 => framed::<_, 0, false, VERIFY>(source),
-        1 => framed::<_, 1, false, VERIFY>(source),
-        2 => framed::<_, 1, true, VERIFY>(source),
-        3 => framed::<_, 2, false, VERIFY>(source),
-        4 => standard::<_, 0, true, VERIFY>(source),
-        5 => standard::<_, 1, true, VERIFY>(source),
-        6 => standard::<_, 2, true, VERIFY>(source),
-        7 => bytes_mut::<_, 0, VERIFY>(source),
-        8 => bytes_mut::<_, 1, VERIFY>(source),
-        9 => bytes_mut::<_, 2, VERIFY>(source),
-        10 => accumulating::<_, false, VERIFY>(source),
-        11 => accumulating::<_, true, VERIFY>(source),
-        12 => standard::<_, 1, false, VERIFY>(source),
+        0 => framed::<_, 0, VERIFY>(source),
+        1 => framed::<_, 1, VERIFY>(source),
+        2 => framed::<_, 2, VERIFY>(source),
+        3 => standard::<_, 0, true, VERIFY>(source),
+        4 => standard::<_, 1, true, VERIFY>(source),
+        5 => standard::<_, 2, true, VERIFY>(source),
+        6 => bytes_mut::<_, 0, VERIFY>(source),
+        7 => bytes_mut::<_, 1, VERIFY>(source),
+        8 => bytes_mut::<_, 2, VERIFY>(source),
+        9 => accumulating::<_, false, VERIFY>(source),
+        10 => accumulating::<_, true, VERIFY>(source),
+        11 => standard::<_, 1, false, VERIFY>(source),
         _ => unreachable!(),
     }
 }
@@ -409,23 +397,23 @@ fn compare<R: Read + Seek>(
     }
     // Compare identical output types; Vec and BytesMut have different
     // ownership and allocation costs even though both own their bytes.
-    let borrowed_best = [1, 2, 4, 7]
+    let borrowed_best = [1, 3, 6]
         .into_iter()
         .map(|mode| times[mode][SAMPLES / 2])
         .fold(f64::INFINITY, f64::min);
-    let vec_best = [3, 5, 6, 8, 10, 11, 12]
+    let vec_best = [2, 4, 5, 7, 9, 10, 11]
         .into_iter()
         .map(|mode| times[mode][SAMPLES / 2])
         .fold(f64::INFINITY, f64::min);
-    let bytes_best = times[0][SAMPLES / 2].min(times[9][SAMPLES / 2]);
+    let bytes_best = times[0][SAMPLES / 2].min(times[8][SAMPLES / 2]);
     let mut rows = Vec::new();
-    // Keep the three Lines variants adjacent without changing timing order.
-    for mode in [1, 2, 4, 7, 3, 10, 11, 5, 12, 8, 6, 0, 9] {
+    // Group matching result types without changing timing order.
+    for mode in [1, 3, 6, 2, 9, 10, 4, 11, 7, 5, 0, 8] {
         let method = METHODS[mode];
         let values = &times[mode];
         let (item, best) = match mode {
-            1 | 2 | 4 | 7 => ("borrowed", borrowed_best),
-            0 | 9 => ("BytesMut", bytes_best),
+            1 | 3 | 6 => ("borrowed", borrowed_best),
+            0 | 8 => ("BytesMut", bytes_best),
             _ => ("Vec<u8>", vec_best),
         };
         rows.push(table::Row {
@@ -568,9 +556,9 @@ fn main() -> io::Result<()> {
              Read request sizes can differ, and no artificial short-read limit is applied."
         );
         println!(
-            "Framing: decode_view compares ready_split(..end, 0) with \
-             ready_copy(..end, end); both return borrowed slices without \
-             copying. decode_bytes and decode_owned use ready_split(..end, 0)."
+            "Framing: all FramedRead paths select ..end and request consumption of end bytes. \
+             decode_bytes transfers the selection; decode_view and \
+             decode_owned receive a slice without copying."
         );
         println!(
             "All explicit framing paths share find_line_end(); all fresh Vec \

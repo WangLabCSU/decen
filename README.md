@@ -10,11 +10,9 @@ for defining frame boundaries, decoding frames, and encoding values, together
 with buffered readers and writers that use those implementations.
 
 The default configuration supports stable Rust. The `nightly` feature switches
-`FramedRead` to `Read::read_buf` and requires nightly Rust. This uses the
-standard-library features `read_buf`, `core_io_borrowed_buf`, and
-`borrowed_buf_init` to read into uninitialized space and track its
-initialization state. This can avoid initializing the read destination for
-sources that support this API.
+`FramedRead` to `Read::read_buf` and requires nightly Rust. Sources with their
+own `read_buf` implementation can avoid initializing the destination before
+reading.
 
 To enable the nightly read path, use
 `cargo +nightly build --features nightly`.
@@ -85,24 +83,46 @@ To decode with `FramedRead`, implement `Framer` and at least one of
 boundaries can depend on format state, such as quoting or length prefixes.
 Implement `Encoder<Item>` to write an Item's encoded bytes.
 
-`Framer::frame` returns a `Frame` describing the next action.
+`Framer::frame` returns a `Frame` with a consumption setting and a `FrameAction`:
+`Ready(start, end)` decodes one Item, `Reframe` immediately frames the remaining
+input, and `NeedMore` attempts a read before framing again. Inspect the complete
+decision through `consume()` and `action()`.
 
-- `ready_split(range, addition)`: Selects `range` and consumes through its end
-  plus `addition` bytes; `decode_bytes()` transfers the selection without
-  copying.
-- `ready_copy(range, consume)`: Selects `range` independently of consuming the
-  first `consume` bytes, allowing adjacent frames to overlap; `decode_bytes()`
-  copies the framed bytes.
-- `skip(amount)`: Skips the first `amount` bytes of the current input without
-  producing an Item.
-- `need_more(consume)`: Consumes the first `consume` bytes of the current input
-  before requesting more data.
+- `ready(range)`: Requests selection of the range and consumption through its
+  end by default.
+- `reframe()`: Creates a `Reframe` decision with zero consumption.
+- `need_more()`: Creates a `NeedMore` decision with zero consumption.
+- `with_consume(consume)`: Returns the decision with an explicit consumption count,
+  independently of the selection, allowing adjacent frames to overlap.
+- `with_action(action)`: Returns the decision with another action, keeping any
+  explicit consumption count.
 
-Both ready actions can be used with any of the three decoder traits. All
-selections and consumption counts are relative to the input passed to `frame`
-and must fit within it, including counts passed to `skip` and `need_more`.
-Empty Items and zero consumption are allowed. `skip(amount)` immediately
-resumes framing. `need_more(consume)` attempts a read before framing again.
+Use `FrameAction::ready(range)` to construct a ready action, including when
+replacing an action with `with_action`.
+
+For example, `ready(1..4)` consumes 4 bytes, and `ready(..)` consumes all input
+supplied to the framer when the reader applies the decision. `consume()` returns
+`None` for the action's default, or
+`Some(n)` after setting an explicit count. Set it separately when needed:
+
+```rust
+use decen::read::Frame;
+
+let frame = Frame::need_more().with_consume(4);
+
+let frame = Frame::ready(..4).with_consume(0); // Retain all input.
+```
+
+`Ready` works with all three decoder traits. `decode_bytes()` transfers the
+selection without copying when consumption covers the prefix through its end;
+otherwise, it copies the selection into a new `BytesMut`. `decode_view()` and
+`decode_owned()` always pass a slice without this copy.
+
+The reader interprets selections relative to the input before consumption and
+rejects ranges or consumption counts outside that input. Empty Items and zero
+consumption are allowed. Reading or decoding errors do not undo consumption.
+For example, selecting `1..4` and requesting consumption of 5 bytes selects
+`abc` from `<abc>tail` and leaves `tail`.
 
 The decoder receives framed bytes. A view Item can borrow fields directly;
 converted fields, such as unescaped text, can use storage owned by the Item.
@@ -131,9 +151,9 @@ impl Framer for ByteCodec {
 
     unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
         Ok(if src.is_empty() {
-            Frame::need_more(0)
+            Frame::need_more()
         } else {
-            Frame::ready_split(..1, 0)
+            Frame::ready(..1)
         })
     }
 }

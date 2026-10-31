@@ -33,6 +33,10 @@ Oversized Items repeat 16 KiB + 3 B, 64 KiB + 5 B, 100 KiB + 7 B,
 Read sizes include the final newline. Write sizes are the bytes written per
 Item. Initial buffer capacity is 8 KiB.
 
+Each workload mixes its listed sizes in one dataset. Its table reports the
+whole mixture, not individual results for each size. The oversized workload
+exercises Items larger than the initial buffer, including buffer growth.
+
 To check read results without timing, append `-- --test` to either read command.
 
 Reading the tables:
