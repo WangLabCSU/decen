@@ -1,6 +1,6 @@
 [package]
 name = "decen"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Yun Peng <pengyun.me@outlook.com>"]
 edition = "2024"
 description = "A decoder and encoder (decen) framework for byte streams"
