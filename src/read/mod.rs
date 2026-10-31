@@ -174,9 +174,11 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
             return Ok(None);
         };
         let bytes = match ready {
-            FrameReady::Copy { range, consume } => self.buffer.take_bytes(range.bounds(), consume),
+            FrameReady::Copy { range, consume } => {
+                self.buffer.take_copy_bytes(range.bounds(), consume)
+            }
             FrameReady::Split { range, addition } => {
-                self.buffer.take_bytes_to(range.bounds(), addition)
+                self.buffer.take_split_bytes(range.bounds(), addition)
             }
         };
         self.decoder.decode_bytes(bytes).map(Some)
@@ -252,7 +254,6 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         loop {
             let buf = self.buffer.buffer();
             let frame = if self.eof {
-                std::hint::cold_path();
                 self.decoder.frame_eof(buf)?
             } else {
                 self.decoder.frame(buf)?
@@ -556,10 +557,7 @@ mod test {
 
     #[test]
     fn short_reads_and_large_items_roundtrip_in_both_modes() {
-        for (payload_len, limit) in [(6, 1), (24, 3), (20_000, 8192), (20_000, 30_000)] {
-            // Bytewise reads use small frames because pending input doubles the
-            // read capacity. Large frames exercise refills without thousands of
-            // deliberate short reads and exponential test allocations.
+        for (payload_len, limit) in [(6, 1), (24, 3), (128, 1), (20_000, 8192), (20_000, 30_000)] {
             let items = [
                 vec![b'\n'],
                 vec![0, 255, 13, b'\n'],
@@ -590,6 +588,58 @@ mod test {
                 drop(reader);
                 for (actual, expected) in kept.iter().zip(&items) {
                     assert_eq!(actual.as_ref(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn small_items_reuse_capacity_across_unaligned_and_short_reads() {
+        struct Source<'a> {
+            bytes: &'a [u8],
+            limit: usize,
+            largest_request: usize,
+        }
+        impl Read for Source<'_> {
+            fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+                assert!(dst.len() <= 64, "small Items must not grow the read buffer");
+                self.largest_request = self.largest_request.max(dst.len());
+                let len = dst.len().min(self.limit);
+                self.bytes.read(&mut dst[..len])
+            }
+        }
+
+        let items: [&[u8]; 3] = [b"abc\n", b"0123456789\n", b"xy\n"];
+        let wire = items.concat().repeat(32);
+        for limit in [1, usize::MAX] {
+            for mode in 0..3 {
+                for retain in [false, true] {
+                    let source = Source {
+                        bytes: &wire,
+                        limit,
+                        largest_request: 0,
+                    };
+                    let mut reader = FramedRead::with_capacity(source, Lines::default(), 64);
+                    let mut kept = Vec::new();
+                    for expected in items.into_iter().cycle().take(96) {
+                        match mode {
+                            0 => {
+                                let item = reader.decode_bytes().unwrap().unwrap();
+                                assert_eq!(&item[..], expected);
+                                if retain {
+                                    kept.push(item);
+                                }
+                            }
+                            1 => assert_eq!(reader.decode_view().unwrap().unwrap(), expected),
+                            _ => assert_eq!(reader.decode_owned().unwrap().unwrap(), expected),
+                        }
+                    }
+                    assert!(reader.decode_bytes().unwrap().is_none());
+                    assert_eq!(reader.reader().largest_request, 64);
+                    drop(reader);
+                    for (item, expected) in kept.iter().zip(items.into_iter().cycle()) {
+                        assert_eq!(&item[..], expected);
+                    }
                 }
             }
         }

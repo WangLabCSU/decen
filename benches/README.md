@@ -17,6 +17,11 @@ By default, `FramedRead` and direct `BytesMut` use `Read::read` with initialized
 destinations. `FramedRead` tracks initialized spare space; direct `BytesMut`
 initializes its tail on each refill. With `nightly`, both use `Read::read_buf`.
 
+The `BufReader::fill_buf()` comparisons use the same code in both configurations.
+On the tested standard library, `fill_buf()` already refills its internal buffer
+through the source's `Read::read_buf`; this does not depend on this crate's
+`nightly` feature.
+
 Read compares `FramedRead`, `BufReader`, and direct `BytesMut` buffering.
 `FramedRead` retains partial frames separately and refills whole chunks.
 `decode_view()` joins crossing frames; `decode_owned()` copies the selected

@@ -3,7 +3,8 @@
 //! 500 B, 1000 B, and 1500 B respectively, including LF.
 //! A fourth read-only workload uses Items larger than the initial buffer.
 //! Run with `cargo bench --bench read`; add `--features nightly` on nightly
-//! Rust to use Read::read_buf.
+//! Rust to use Read::read_buf for FramedRead and direct BytesMut buffering.
+//! BufReader::fill_buf already uses read_buf internally on the tested std.
 
 #![cfg_attr(feature = "nightly", feature(core_io_borrowed_buf, read_buf))]
 
